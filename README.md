@@ -10,7 +10,9 @@ Broadcast channels are excluded by default. The source contains an internal exac
 
 ## Getting started
 
-Read the [Russian beginner guide](docs/GETTING-STARTED.ru.md) before creating a Telegram session or exposing a server. It covers local setup, Auth0, the ChatGPT callback, Docker, TLS, and troubleshooting. Sample configuration files contain placeholders only.
+Новый пользователь: начните с [короткой инструкции без требований к навыкам разработки](docs/START-HERE.ru.md) и отправьте её своему ИИ-агенту.
+
+Агенту: [подробная инструкция по настройке](docs/GETTING-STARTED.ru.md) описывает Telegram session, OAuth/Auth0, подключение ChatGPT, Docker, TLS и проверку запуска. Пользователь подтверждает входы, коды, разрешения и секретные данные; агент не должен просить отправлять их в чат. Примеры конфигураций содержат только фиктивные значения.
 
 ## Tests
 
