@@ -5,12 +5,12 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from argparse import Namespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from telethon.errors import SessionPasswordNeededError
 
 from telegram_assistant.telegram_login import (
-    LoginSetupError, _confirmed_send, _run, provision_session,
+    LoginSetupError, _TTYConsole, _confirmed_send, _run, provision_session,
 )
 
 
@@ -51,6 +51,46 @@ class FakeClient:
 
     async def disconnect(self):
         return None
+
+
+class TerminalFlagTests(unittest.TestCase):
+    def terminal_flags(self):
+        return SimpleNamespace(
+            ICRNL=0x100, INLCR=0x40, IGNCR=0x80, ISTRIP=0x20,
+            ICANON=2, ECHO=8, ECHONL=0x40, TCSAFLUSH=2,
+            tcgetattr=Mock(return_value=[0, 0, 0, 0, 0, 0, []]),
+            tcsetattr=Mock(),
+        )
+
+    def test_utf8_flag_uses_native_constant_or_linux_fallback(self):
+        for platform, native, expected in (("linux", None, 0x4000), ("darwin", 0x8000, 0x8000)):
+            with self.subTest(platform=platform):
+                flags = self.terminal_flags()
+                if native is not None:
+                    flags.IUTF8 = native
+                console = _TTYConsole()
+                console.fd = 7
+                with patch("telegram_assistant.telegram_login.termios", flags), \
+                     patch("telegram_assistant.telegram_login.sys.platform", platform), \
+                     patch("telegram_assistant.telegram_login.os.write"), \
+                     patch("telegram_assistant.telegram_login.os.read", side_effect=[b"x", b"\n"]):
+                    self.assertEqual(console.read("Test prompt: ", hidden=True), "x")
+                self.assertEqual(flags.tcsetattr.call_args_list[0].args[2][0] & expected, expected)
+                self.assertEqual(flags.tcsetattr.call_args_list[0].args[2][3] & flags.ECHO, 0)
+                self.assertEqual(flags.tcsetattr.call_args_list[-1].args[2], [0, 0, 0, 0, 0, 0, []])
+
+    def test_unknown_platform_without_utf8_flag_fails_before_reading(self):
+        flags = self.terminal_flags()
+        console = _TTYConsole()
+        console.fd = 7
+        with patch("telegram_assistant.telegram_login.termios", flags), \
+             patch("telegram_assistant.telegram_login.sys.platform", "unsupported"), \
+             patch("telegram_assistant.telegram_login.os.read") as read:
+            with self.assertRaises(LoginSetupError) as raised:
+                console.read("Test prompt: ", hidden=True)
+        self.assertEqual(raised.exception.code, "utf8_terminal_flag_unavailable")
+        flags.tcsetattr.assert_not_called()
+        read.assert_not_called()
 
 
 class LoginProvisionTests(unittest.IsolatedAsyncioTestCase):

@@ -114,7 +114,11 @@ class _TTYConsole:
         new = old.copy()
         # Canonical erase must remove a complete UTF-8 character. Without
         # IUTF8, deleting Cyrillic leaves a leading byte and breaks decoding.
-        new[0] = (new[0] | termios.ICRNL | termios.IUTF8) & ~(
+        # Python 3.12 on Linux omits IUTF8; the Linux UAPI bit is 0x4000.
+        iutf8 = getattr(termios, "IUTF8", 0x4000 if sys.platform == "linux" else None)
+        if iutf8 is None:
+            raise LoginSetupError("utf8_terminal_flag_unavailable")
+        new[0] = (new[0] | termios.ICRNL | iutf8) & ~(
             termios.INLCR | termios.IGNCR | termios.ISTRIP
         )
         new[3] |= termios.ICANON
