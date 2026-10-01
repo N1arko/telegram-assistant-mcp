@@ -1,0 +1,41 @@
+# Local-only example. Do not expose port 8876 to the public internet.
+services:
+  assistant:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: telegram-assistant-mcp:local
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    init: true
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 1.0
+    ports:
+      - "127.0.0.1:8876:8876"
+    volumes:
+      - type: bind
+        source: ../private/auth.json
+        target: /run/assistant/auth.json
+        read_only: true
+      - type: bind
+        source: ../private/telegram/telegram.json
+        target: /run/assistant/telegram.json
+        read_only: true
+      - type: bind
+        source: ../private/policy.json
+        target: /run/assistant/policy.json
+        read_only: true
+      - type: bind
+        source: ../private/session
+        target: /sessions
+      - type: bind
+        source: ../private/state
+        target: /state
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    logging:
+      driver: none

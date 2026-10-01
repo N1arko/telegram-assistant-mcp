@@ -1,0 +1,5 @@
+{
+  "api_id": 123456,
+  "api_hash": "REPLACE_WITH_PRIVATE_32_CHARACTER_HASH",
+  "session_file": "/sessions/assistant.session"
+}

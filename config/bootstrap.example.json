@@ -1,0 +1,5 @@
+{
+  "issuer": "https://YOUR_AUTH0_TENANT/",
+  "resource": "https://telegram-mcp.example.net/mcp",
+  "scopes": ["telegram:read"]
+}

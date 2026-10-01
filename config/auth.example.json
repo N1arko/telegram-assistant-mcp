@@ -1,0 +1,7 @@
+{
+  "issuer": "https://YOUR_AUTH0_TENANT/",
+  "resource": "https://telegram-mcp.example.net/mcp",
+  "jwks_url": "https://YOUR_AUTH0_TENANT/.well-known/jwks.json",
+  "algorithms": ["RS256"],
+  "allowed_subjects": ["REPLACE_WITH_EXACT_AUTH0_SUBJECT"]
+}

@@ -1,0 +1,52 @@
+import unittest
+import time
+from datetime import datetime, timezone
+from types import SimpleNamespace as NS
+from unittest.mock import AsyncMock
+
+from telethon.tl.types import User, Chat, Channel, InputPeerUser, PeerUser, Message, MessageReplyHeader
+from telegram_assistant.backend import TelethonBackend
+from telegram_assistant.security import Denied
+
+
+class BackendTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.client = NS(get_dialogs=AsyncMock(),get_messages=AsyncMock(),get_input_entity=AsyncMock(),
+                         send_message=AsyncMock(),send_read_acknowledge=AsyncMock(),download_media=AsyncMock())
+        self.backend=TelethonBackend(self.client)
+    async def test_archive_and_marked_ids_and_membership(self):
+        user=User(id=42,first_name="Test")
+        chat=Chat(id=99,title="Group",photo=None,participants_count=2,date=None,version=1)
+        group=Channel(id=123,title="Supergroup",photo=None,date=None,megagroup=True)
+        broadcast=Channel(id=124,title="Broadcast",photo=None,date=None,broadcast=True)
+        self.assertEqual([self.backend._remember(e) for e in [user,chat,group]],[42,-99,-1000000000123])
+        self.assertEqual(self.backend.kind(broadcast),'broadcast_channel')
+        self.client.get_input_entity.return_value=InputPeerUser(42,123)
+        self.assertEqual(await self.backend.resolve(42),(42,"user"))
+        self.client.get_input_entity.side_effect=ValueError('not in cache')
+        with self.assertRaises(Denied):await self.backend.resolve(777)
+        self.client.get_dialogs.assert_not_awaited()
+    async def test_telethon_read_args_and_no_ack(self):
+        self.backend.peers={42:User(id=42)}
+        message=Message(id=10,peer_id=PeerUser(42),date=datetime.now(timezone.utc),message="caption",
+                        reply_to=MessageReplyHeader(reply_to_msg_id=3))
+        self.client.get_messages.return_value=[message]
+        data=await self.backend.history(42,limit=4,before_id=11,query="caption")
+        self.client.get_messages.assert_awaited_with(self.backend.peers[42],limit=4,offset_id=11,search="caption")
+        self.assertEqual(data[0]["reply_to"],3)
+        self.client.get_messages.return_value=message
+        await self.backend.message(42,10)
+        self.client.get_messages.assert_awaited_with(self.backend.peers[42],ids=10)
+        self.client.get_messages.return_value=[message]
+        await self.backend.around(42,10,3)
+        self.client.get_messages.assert_any_await(self.backend.peers[42],limit=3,max_id=10)
+        self.client.get_messages.assert_any_await(self.backend.peers[42],limit=3,min_id=10,reverse=True)
+        self.client.send_read_acknowledge.assert_not_awaited()
+        self.client.download_media.assert_not_awaited()
+        self.client.send_message.assert_not_awaited()
+    async def test_send_plain_text_adapter_only_mock(self):
+        self.backend.peers={42:User(id=42)}
+        self.client.send_message.return_value=NS(id=100)
+        self.assertEqual(await self.backend.send(42,"**test**",3),100)
+        self.client.send_message.assert_awaited_once_with(self.backend.peers[42],"**test**",parse_mode=None,
+                                                        link_preview=False,reply_to=3)

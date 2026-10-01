@@ -1,0 +1,16 @@
+# Local Python environment and generated files
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.build/
+dist/
+
+# Private operator state: never commit Telegram or OAuth material
+.env
+.env.*
+!.env.example
+private/
+*.session
+*.session-*
+quotas.sqlite*

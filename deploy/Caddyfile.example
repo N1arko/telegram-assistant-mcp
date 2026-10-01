@@ -1,0 +1,18 @@
+# Example only; use your domain and a dedicated backend network. No access log.
+telegram-mcp.example.net {
+    @mcp path /mcp /.well-known/oauth-protected-resource/mcp
+    handle @mcp {
+        request_body {
+            max_size 64KB
+        }
+        reverse_proxy assistant:8876 {
+            transport http {
+                dial_timeout 5s
+                response_header_timeout 30s
+            }
+        }
+    }
+    handle {
+        respond 404
+    }
+}

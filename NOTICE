@@ -1,0 +1,5 @@
+Telegram Assistant MCP is an independent restricted adapter inspired in part by chigwell/telegram-mcp (Apache-2.0):
+https://github.com/chigwell/telegram-mcp
+
+Upstream revision: 81ad14bd076d17babd8be2425965235b0c6b9e26.
+The file src/telegram_assistant/session_lock.py was copied unchanged from upstream telegram_mcp/singleton.py at that revision. The other adapter modules are independent implementations. This repository does not ship the upstream snapshot, scripts, or MCP runtime. The original Apache-2.0 license is retained in LICENSE.
