@@ -2,11 +2,11 @@
 
 **English | [Русский](README.ru.md)**
 
-A small, read-only MCP server for searching a Telegram user's personal chats and groups. It uses a private Telethon user session and validates OAuth access tokens before every MCP request.
+A small MCP server for searching a Telegram user's personal chats and groups. It uses a private Telethon user session and validates OAuth access tokens before every MCP request. Use read-only mode for the setup described here.
 
 ## What it can do
 
-Read-only mode exposes four bounded, paginated tools: `list_dialogs`, `get_history`, `search_messages`, and `get_reply_context`. It does not provide tools to send, edit, delete, join, or mark messages as read, or to manage permissions. Broadcast channels are filtered by default, so this is not universal access to every Telegram chat or channel.
+In `--read-only` mode, four bounded, paginated tools are available: `list_dialogs`, `get_history`, `search_messages`, and `get_reply_context`. The code also contains a separate permission-gated `send_message` path that is unavailable in read-only mode. It is outside this setup, and live Telegram sending has not been verified. Do not enable it for this use. Broadcast channels are filtered by default, so this is not universal access to every Telegram chat or channel.
 
 ## What you'll need
 

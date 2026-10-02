@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'config/**'
+      - 'deploy/**'
+      - 'docs/**'
+      - 'README*'
+      - 'pyproject.toml'
+      - 'requirements.lock'
+      - '.github/workflows/**'
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'tests/**'
+      - 'config/**'
+      - 'deploy/**'
+      - 'docs/**'
+      - 'README*'
+      - 'pyproject.toml'
+      - 'requirements.lock'
+      - '.github/workflows/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install locked dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.lock
+          .venv/bin/python -m pip install --no-deps --no-build-isolation -e .
+      - name: Run full mock suite in a PTY
+        run: script -q -e -c '.venv/bin/python -m unittest discover -s tests' /dev/null
+
+  docker-smoke:
+    name: Docker bootstrap smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --file deploy/Dockerfile --tag telegram-assistant-mcp:ci .
+      - name: Check metadata-only bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          container=telegram-assistant-mcp-ci
+          bootstrap="$(mktemp)"
+          cp config/bootstrap.example.json "$bootstrap"
+          sudo chown 10001:10001 "$bootstrap"
+          chmod 600 "$bootstrap"
+          cleanup() {
+            docker rm --force "$container" >/dev/null 2>&1 || true
+            rm -f "$bootstrap"
+          }
+          trap cleanup EXIT
+          docker run --detach --rm --name "$container" \
+            --publish 127.0.0.1::8876 \
+            --volume "$bootstrap:/run/assistant/bootstrap.json:ro" \
+            telegram-assistant-mcp:ci \
+            --container-network --mode bootstrap \
+            --bootstrap-config /run/assistant/bootstrap.json
+          port="$(docker port "$container" 8876/tcp | sed 's/.*://')"
+          url="http://127.0.0.1:${port}"
+          ready=false
+          for _ in $(seq 1 30); do
+            if curl --silent --fail --output /dev/null \
+              --header 'Host: telegram-mcp.example.net' \
+              "$url/.well-known/oauth-protected-resource/mcp"; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = true
+          curl --silent --show-error --fail \
+            --header 'Host: telegram-mcp.example.net' \
+            "$url/.well-known/oauth-protected-resource/mcp" \
+            | python -c 'import json,sys; d=json.load(sys.stdin); assert d["resource"] == "https://telegram-mcp.example.net/mcp"'
+          status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --header 'Host: telegram-mcp.example.net' \
+            --header 'Content-Type: application/json' \
+            --data '{}' "$url/mcp")"
+          test "$status" = 401
