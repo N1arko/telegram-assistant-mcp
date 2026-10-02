@@ -26,6 +26,8 @@ A VPS, domain, or OAuth provider may cost money. Check prices before signing up.
 
 Your agent can prepare the server and configuration files, but you handle sign-ins, codes, passwords, and consent. You don’t need programming skills or to retype long commands. Ask the agent to explain each step and carry out technical work through the tools available to it.
 
+This quick start stays read-only. The separate operator rules for the optional send path are in the [local send policy guide](SENDING-POLICY.en.md).
+
 ## Task for your AI agent
 
 > Help me set up this project on my VPS and connect it to ChatGPT as a personal, read-only Telegram MCP. I’m not a developer: briefly explain what you’re doing and when you need me to sign in or approve something. Follow the [detailed agent setup guide](GETTING-STARTED.en.md). First check whether custom MCP is available in my ChatGPT account and what costs may apply. Don’t ask me to copy long commands by hand.

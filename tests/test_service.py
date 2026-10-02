@@ -29,6 +29,8 @@ class Fake:
         self.dialog_calls = []
         self.peer_type = "user"
         self.human_user = True
+        self.human_users = {}
+        self.human_check_calls = []
         self.first_inbound = True
         self.first_contact_barrier = None
     def start_dialogs(self, archived):
@@ -41,7 +43,8 @@ class Fake:
     async def resolve(self, target):
         return target, self.peer_type
     async def is_human_user(self, target):
-        return self.human_user
+        self.human_check_calls.append(target)
+        return self.human_users.get(target, self.human_user)
     async def verify_first_inbound(self, target, message_id):
         if self.first_contact_barrier is not None:
             await self.first_contact_barrier.wait()
@@ -261,7 +264,23 @@ class SecurityTests(unittest.TestCase):
         old["grants"][0]["expires_at"]=None
         permanent=Policy._parse(old)
         self.assertIsNone(permanent.grants[42].expires_at)
-        self.assertEqual(permanent.authorize(42,"x",frozenset({"telegram:send"}),10).expires_at,None)
+        self.assertEqual(permanent.authorize(42,"x",frozenset({"telegram:send"}),10,
+                                             peer_type="user",is_human=True).expires_at,None)
+
+    def test_exact_user_grants_require_a_human_and_exact_groups_remain_allowed(self):
+        grant={"peer_id":42,"operation":"send_message","expires_at":None,
+               "max_chars":100,"per_minute":1,"per_day":20}
+        policy=self.v2(grants=[grant])
+        self.assertEqual(policy.authorize(42,"x",frozenset({"telegram:send"}),10,
+                                          peer_type="user",is_human=True).peer_id,42)
+        for peer_type,is_human in [("user",False),(None,False),("channel",False)]:
+            with self.subTest(peer_type=peer_type,is_human=is_human):
+                with self.assertRaises(Denied):
+                    policy.authorize(42,"x",frozenset({"telegram:send"}),10,
+                                     peer_type=peer_type,is_human=is_human)
+        group=self.v2(grants=[{**grant,"peer_id":-99}])
+        self.assertEqual(group.authorize(-99,"x",frozenset({"telegram:send"}),10,
+                                         peer_type="group").peer_id,-99)
 
     def test_v2_selectors_deny_override_and_expiry(self):
         fields={"operation":"send_message","peer_ids":[],"expires_at":None,
@@ -317,6 +336,29 @@ class ExtraWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["error"],"peer_mismatch")
         self.fake.send.assert_not_awaited()
         self.assertEqual(self.q.db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0],0)
+
+    async def test_exact_grant_checks_bot_and_self_before_send(self):
+        grants=[{"peer_id":peer,"operation":"send_message","expires_at":None,
+                 "max_chars":100,"per_minute":1,"per_day":20} for peer in (42,43)]
+        self.s.policy=SecurityTests.v2(grants=grants)
+        self.fake.human_users={42:False,43:False}
+        for peer,kind in ((42,"bot"),(43,"self")):
+            with self.subTest(kind=kind):
+                result=await self.s.invoke("send_message",peer_id=peer,text="operator-approved text")
+                self.assertEqual(result["error"],"peer_not_human")
+                self.assertIn(peer,self.fake.human_check_calls)
+                self.fake.send.assert_not_awaited()
+
+    async def test_exact_group_grant_stays_limited_to_its_peer(self):
+        self.s.policy=SecurityTests.v2(grants=[{"peer_id":-99,"operation":"send_message",
+            "expires_at":None,"max_chars":100,"per_minute":1,"per_day":20}])
+        self.fake.peer_type="group"
+        result=await self.s.invoke("send_message",peer_id=-99,text="operator-approved text")
+        self.assertTrue(result["sent"])
+        self.fake.send.reset_mock()
+        denied=await self.s.invoke("send_message",peer_id=-98,text="operator-approved text")
+        self.assertEqual(denied["error"],"send_denied")
+        self.fake.send.assert_not_awaited()
     async def test_expiry_rechecked_after_resolution(self):
         async def resolve(target):
             self.now=200000

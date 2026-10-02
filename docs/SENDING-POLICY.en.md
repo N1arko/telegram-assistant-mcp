@@ -1,5 +1,7 @@
 # Local send policy
 
+**English | [Русский](SENDING-POLICY.ru.md)**
+
 Message sending is disabled by default. The local operator policy is a technical
 barrier in addition to the assistant's check that a user's instruction is
 current and applies to the recipient and message. It does not encode semantic
@@ -10,8 +12,9 @@ is a local command-line tool; it is not exposed through MCP.
 
 Use a policy file outside the source repository. Its parent directory and the
 file must belong to the current OS user and be private to that user. The editor
-rejects symlinks and policy paths inside a Git repository, and writes updates
-atomically. Never commit a live policy file.
+resolves ancestor aliases before checking the destination, rejects policy-file
+symlinks and paths inside a Git repository, and writes updates atomically.
+Never commit a live policy file.
 
 Start from `config/policy.example.json`. It has no grants or denials and sets a
 global ceiling of 5 sends per minute and 100 per day. Each recipient grant or

@@ -13,18 +13,57 @@ import tempfile
 from .security import Denied, Policy, integer, peer_id, private_file
 
 
+def _absolute_resolved_path(path: Path) -> tuple[Path, Path]:
+    lexical = Path(os.path.abspath(os.fspath(path)))
+    try:
+        resolved = lexical.resolve(strict=False)
+    except (OSError, RuntimeError):
+        raise Denied("unsafe_policy_path") from None
+    return lexical, resolved
+
+
+def _check_no_symlink_components(path: Path):
+    for component in (path, *path.parents):
+        try:
+            st = component.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            raise Denied("unsafe_policy_path") from None
+        if stat.S_ISLNK(st.st_mode):
+            raise Denied("unsafe_policy_path")
+
+
+def _has_git_marker(path: Path) -> bool:
+    return any((ancestor / ".git").exists() or (ancestor / ".git").is_symlink()
+               for ancestor in (path, *path.parents))
+
+
 def _check_directory(path: Path):
-    if path.is_symlink():
-        raise Denied("unsafe_policy_directory")
-    st = path.stat()
+    _, resolved = _absolute_resolved_path(path)
+    _check_no_symlink_components(resolved)
+    try:
+        st = resolved.stat()
+    except OSError:
+        raise Denied("unsafe_policy_directory") from None
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid() or st.st_mode & 0o077:
         raise Denied("unsafe_policy_directory")
+    return resolved
 
 
 def _check_external_policy(path: Path):
-    _check_directory(path.parent)
-    if any((ancestor / ".git").exists() for ancestor in (path.parent, *path.parent.parents)):
+    lexical, resolved = _absolute_resolved_path(Path(path))
+    # Resolve ancestors before checking repository boundaries. Reject a
+    # symlink as the policy file itself, but allow safe system aliases such as
+    # /tmp -> /private/tmp when their resolved destination is external.
+    if lexical.is_symlink():
+        raise Denied("unsafe_policy_path")
+    _check_no_symlink_components(resolved)
+    resolved_parent = _check_directory(resolved.parent)
+    resolved = resolved_parent / resolved.name
+    if _has_git_marker(lexical.parent) or _has_git_marker(resolved.parent):
         raise Denied("policy_must_be_outside_repository")
+    return resolved
 
 
 def _open_lock(path: Path):
@@ -63,8 +102,7 @@ def _atomic_write(path: Path, data):
 
 def update_policy(path: Path, action: str, *, selector=None, peer_ids=(), expires_at=None,
                   max_chars=4096, per_minute=1, per_day=20, rule_id=None):
-    path = Path(path)
-    _check_external_policy(path)
+    path = _check_external_policy(Path(path))
     lock_fd = _open_lock(path)
     try:
         if path.is_symlink():
@@ -177,8 +215,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.action == "validate":
-            _check_external_policy(args.policy)
-            Policy.load_strict(args.policy)
+            path = _check_external_policy(args.policy)
+            Policy.load_strict(path)
             print("policy_valid")
             return 0
         action_map = {"grant-peer": "grant_peer", "deny-peer": "deny_peer", "allow-peer": "allow_peer",

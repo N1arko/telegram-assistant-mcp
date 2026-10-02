@@ -82,3 +82,8 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.backend.peers[44]=incomplete
         self.assertFalse(await self.backend.is_human_user(44))
         self.assertFalse(await self.backend.verify_first_inbound(44,8))
+
+    async def test_own_account_is_not_classified_as_human(self):
+        own=User(id=45,first_name="Synthetic self",bot=False,is_self=True)
+        self.backend._remember(own)
+        self.assertFalse(await self.backend.is_human_user(45))

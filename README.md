@@ -19,14 +19,14 @@ In `--read-only` mode, four bounded, paginated tools are available: `list_dialog
 
 Send the [beginner guide](docs/START-HERE.en.md) to your AI agent and ask it to guide you through setup. You do not need programming skills or to retype long commands. You handle sign-ins, Telegram login codes and 2FA, and consent; enter secrets only in protected fields or hidden local prompts.
 
-- English: [beginner guide](docs/START-HERE.en.md) · [detailed technical setup for agents](docs/GETTING-STARTED.en.md)
-- Русский: [короткая инструкция](docs/START-HERE.ru.md) · [подробная техническая инструкция для агента](docs/GETTING-STARTED.ru.md)
+- English: [beginner guide](docs/START-HERE.en.md) · [detailed technical setup for agents](docs/GETTING-STARTED.en.md) · [local send policy](docs/SENDING-POLICY.en.md)
+- Русский: [короткая инструкция](docs/START-HERE.ru.md) · [подробная техническая инструкция для агента](docs/GETTING-STARTED.ru.md) · [политика отправки](docs/SENDING-POLICY.ru.md)
 
 Keep read-only mode enabled. Never share or commit secrets or Telegram session files. Do not use Telegram messages or read-status changes for testing. Do not stop a running server without the user's separate consent.
 
 ## Development
 
-Use Python 3.11 or newer. The test suite uses mocked Telegram clients, HTTP MockTransport, and in-process ASGI; it does not log in to Telegram or open a listening socket. The full suite, including fake-login PTY tests, was verified with Python 3.14.6 and all 146 tests passed. PTY tests require a normal controlling terminal. The lock includes the optional QR renderer used by the tests; Docker templates require validation on the target Linux host.
+Use Python 3.11 or newer. The test suite uses mocked Telegram clients, HTTP MockTransport, and in-process ASGI; it does not log in to Telegram or open a listening socket. The full suite, including fake-login PTY tests, was verified with Python 3.14.6 and all 182 tests passed. PTY tests require a normal controlling terminal. The lock includes the optional QR renderer used by the tests; Docker templates require validation on the target Linux host.
 
     python3 -m venv .venv
     .venv/bin/python -m pip install -r requirements.lock

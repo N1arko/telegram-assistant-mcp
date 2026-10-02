@@ -241,7 +241,8 @@ class Service:
         if self.quotas is None:
             raise Denied("send_denied")
         target, peer_type = await self._resolve(target, return_type=True)
-        needs_human = any(g.selector in {"all_human_dms", "first_contact"} for g in candidates)
+        needs_human = peer_type == "user" or any(
+            g.selector in {"all_human_dms", "first_contact"} for g in candidates)
         is_human = False
         if needs_human:
             check_human = getattr(self.backend, "is_human_user", None)

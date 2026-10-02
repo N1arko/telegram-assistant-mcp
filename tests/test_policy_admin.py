@@ -103,6 +103,59 @@ class PolicyAdminTests(unittest.TestCase):
         with self.assertRaises(Denied):
             update_policy(private/"policy.json","grant_peer",peer_ids=[42])
 
+    def test_external_symlink_ancestor_is_resolved_before_writing(self):
+        target=self.root/"target"
+        nested=target/"nested"
+        nested.mkdir(mode=0o700,parents=True)
+        alias=self.root/"alias"
+        alias.symlink_to(target,target_is_directory=True)
+        resolved=update_policy(alias/"nested"/"policy.json","grant_peer",peer_ids=[42])
+        self.assertIsNone(resolved)
+        self.assertTrue((nested/"policy.json").exists())
+
+    def test_symlink_ancestor_into_repository_subtree_is_rejected(self):
+        repository=self.root/"repository"
+        nested=repository/"child"/"private"
+        nested.mkdir(mode=0o700,parents=True)
+        (repository/".git").mkdir(mode=0o700)
+        alias=self.root/"repository-child"
+        alias.symlink_to(repository/"child",target_is_directory=True)
+        with self.assertRaises(Denied):
+            update_policy(alias/"private"/"policy.json","grant_peer",peer_ids=[42])
+
+    def test_symlink_ancestor_into_worktree_resolves_git_marker_file(self):
+        worktree=self.root/"worktree"
+        nested=worktree/"child"/"private"
+        nested.mkdir(mode=0o700,parents=True)
+        (worktree/".git").write_text("gitdir: ../repository/.git/worktrees/example\n")
+        alias=self.root/"worktree-child"
+        alias.symlink_to(worktree/"child",target_is_directory=True)
+        with self.assertRaises(Denied):
+            update_policy(alias/"private"/"policy.json","grant_peer",peer_ids=[42])
+
+    def test_symlink_loop_fails_closed(self):
+        loop=self.root/"loop"
+        loop.symlink_to(loop)
+        with self.assertRaises(Denied):
+            update_policy(loop/"private"/"policy.json","grant_peer",peer_ids=[42])
+
+    def test_policy_file_symlink_is_rejected(self):
+        target=self.root/"target.json"
+        target.write_text("{}")
+        target.chmod(0o600)
+        link=self.root/"policy.json"
+        link.symlink_to(target)
+        with self.assertRaises(Denied):
+            update_policy(link,"grant_peer",peer_ids=[42])
+
+    def test_git_worktree_marker_file_is_rejected(self):
+        worktree=self.root/"worktree"
+        private=worktree/"private"
+        private.mkdir(mode=0o700,parents=True)
+        (worktree/".git").write_text("gitdir: ../repository/.git/worktrees/example\n")
+        with self.assertRaises(Denied):
+            update_policy(private/"policy.json","grant_peer",peer_ids=[42])
+
     def test_cli_grant_and_validate_do_not_print_peer_data(self):
         output=io.StringIO()
         with contextlib.redirect_stdout(output):

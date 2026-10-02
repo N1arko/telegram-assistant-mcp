@@ -238,7 +238,8 @@ class Policy:
         candidates = self.precheck(target, text, scopes, now)
         matched = []
         for grant in candidates:
-            if grant.selector == "peer":
+            if grant.selector == "peer" and (
+                    peer_type == "group" or (peer_type == "user" and is_human)):
                 matched.append(grant)
             elif grant.selector == "all_human_dms" and peer_type == "user" and is_human:
                 matched.append(grant)
