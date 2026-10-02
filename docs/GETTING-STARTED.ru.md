@@ -1,5 +1,7 @@
 # Подробная инструкция для ИИ-агента
 
+**Русский | [English](GETTING-STARTED.en.md)**
+
 Эта инструкция описывает настройку Telegram Assistant MCP на вашем компьютере или VPS. Она рассчитана на ИИ-агента, который умеет работать с кодом и сервером. Пользователь не должен вручную перепечатывать длинные команды или разбираться в программировании.
 
 ## Обязательные ограничения
@@ -64,6 +66,8 @@
 
 Создайте Custom API для MCP и запишите его Identifier, например `https://telegram-mcp.example.net/mcp`. Значение должно совпадать с адресом MCP resource; это же значение сервер проверяет в audience access token.
 
+В этом подробном примере используется Auth0. Настройки авторизации сервера задаются через issuer, resource и JWKS; использовать другой OAuth-провайдер можно только после проверки совместимости с этими настройками.
+
 Включите подпись RS256 и определите только permission `telegram:read`. Для read-only подключения не создавайте и не назначайте `telegram:send`. Если нужен refresh token, включите у API Allow Offline Access и разрешите приложению запрашивать `offline_access`; выдавайте только необходимые scopes. Auth0 описывает Identifier и профиль подписи в [настройках API](https://auth0.com/docs/get-started/apis/api-settings). Для refresh token нужны `offline_access` и включённый Allow Offline Access; см. [официальную инструкцию Auth0](https://auth0.com/docs/secure/tokens/refresh-tokens).
 
 Заполните `config/auth.example.json`, сохраните копию как `private/auth.json` и задайте режим `0600`:
@@ -82,6 +86,8 @@
 В публичном файле оставьте только фиктивные значения. Не помещайте client secret, refresh token или API hash в Git, environment, командную строку или чат.
 
 ## 4. Создайте подключение ChatGPT
+
+Доступность добавления собственного MCP зависит от тарифа ChatGPT, региона, аккаунта и политики рабочего пространства. Проверьте, что именно доступно в вашем аккаунте и в [актуальной справке OpenAI](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt); не считайте, что все тарифы дают одинаковые возможности.
 
 Для ChatGPT Web нужен remote MCP endpoint с публичным HTTPS. В интерфейсе создания MCP connector задайте URL сервера, оканчивающийся на `/mcp`, и выберите OAuth. Настройте публичный OAuth client, поддерживающий Authorization Code + PKCE S256. Публичному клиенту не требуется и не следует выдавать client secret.
 
