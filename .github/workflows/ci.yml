@@ -39,6 +39,7 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         python-version: ['3.11', '3.12', '3.13', '3.14']
     steps:
@@ -56,6 +57,7 @@ jobs:
 
   docker-smoke:
     name: Docker bootstrap smoke test
+    needs: unit-tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
