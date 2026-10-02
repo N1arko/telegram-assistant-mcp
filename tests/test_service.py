@@ -27,6 +27,10 @@ class Fake:
         self.download_media = AsyncMock()
         self.history_calls = []
         self.dialog_calls = []
+        self.peer_type = "user"
+        self.human_user = True
+        self.first_inbound = True
+        self.first_contact_barrier = None
     def start_dialogs(self, archived):
         return {'rows': [dict(d) for d in self.rows if archived is None or d['archived'] == archived], 'at': 0}
     async def dialog_page(self, state, limit):
@@ -35,7 +39,13 @@ class Fake:
         state['at'] += len(rows)
         return {'rows': rows, 'done': state['at'] == len(state['rows']), 'truncated': False}
     async def resolve(self, target):
-        return target, "user"
+        return target, self.peer_type
+    async def is_human_user(self, target):
+        return self.human_user
+    async def verify_first_inbound(self, target, message_id):
+        if self.first_contact_barrier is not None:
+            await self.first_contact_barrier.wait()
+        return self.first_inbound
     async def history(self, target, *, limit, before_id, query):
         self.history_calls.append((target, limit, before_id, query))
         return [m for m in self.items if (before_id is None or m["id"] < before_id)
@@ -237,6 +247,67 @@ class SecurityTests(unittest.TestCase):
         now[0]=60
         g.check()
 
+    @staticmethod
+    def v2(*, rules=(), grants=(), denies=(), global_per_minute=5, global_per_day=100):
+        return Policy._parse({"version":2,"grants":list(grants),"rules":list(rules),
+            "denies":list(denies),"global_limits":{"per_minute":global_per_minute,"per_day":global_per_day}})
+
+    def test_v1_grants_remain_compatible_and_expiry_may_be_permanent(self):
+        old={"version":1,"grants":[{"peer_id":42,"operation":"send_message","expires_at":200000,
+                                        "max_chars":100,"per_minute":1,"per_day":2}]}
+        policy=Policy._parse(old)
+        self.assertEqual(policy.grants[42].expires_at,200000)
+        self.assertEqual((policy.global_per_minute,policy.global_per_day),(1000,10000))
+        old["grants"][0]["expires_at"]=None
+        permanent=Policy._parse(old)
+        self.assertIsNone(permanent.grants[42].expires_at)
+        self.assertEqual(permanent.authorize(42,"x",frozenset({"telegram:send"}),10).expires_at,None)
+
+    def test_v2_selectors_deny_override_and_expiry(self):
+        fields={"operation":"send_message","peer_ids":[],"expires_at":None,
+                "max_chars":100,"per_minute":1,"per_day":20}
+        rule={"id":"synthetic-all-dms","selector":"all_human_dms",**fields}
+        p=self.v2(rules=[rule],denies=[{"peer_id":42,"expires_at":200}])
+        with self.assertRaises(Denied):p.precheck(42,"x",frozenset({"telegram:send"}),100)
+        self.assertEqual(p.authorize(43,"x",frozenset({"telegram:send"}),100,
+                                     peer_type="user",is_human=True).per_day,20)
+        self.assertEqual(p.authorize(42,"x",frozenset({"telegram:send"}),200,
+                                     peer_type="user",is_human=True).per_day,20)
+        with self.assertRaises(Denied):p.authorize(42,"x",frozenset({"telegram:send"}),100,
+                                                   peer_type="user",is_human=False)
+
+    def test_group_selectors_reject_channels_and_unknown_groups(self):
+        fields={"operation":"send_message","peer_ids":[-99],"expires_at":None,
+                "max_chars":100,"per_minute":1,"per_day":20}
+        p=self.v2(rules=[{"id":"synthetic-group-set","selector":"group_ids",**fields},
+                         {"id":"synthetic-all-groups","selector":"all_groups","peer_ids":[],
+                          "operation":"send_message","expires_at":None,"max_chars":100,
+                          "per_minute":1,"per_day":20}])
+        self.assertEqual(p.authorize(-99,"x",frozenset({"telegram:send"}),100,
+                                     peer_type="group").peer_id,-99)
+        self.assertEqual(p.authorize(-100,"x",frozenset({"telegram:send"}),100,
+                                     peer_type="group").peer_id,-100)
+        with self.assertRaises(Denied):p.authorize(-99,"x",frozenset({"telegram:send"}),100,
+                                                   peer_type="broadcast_channel")
+
+    def test_bulk_rules_expire_at_boundary_and_require_send_scope(self):
+        rule={"id":"synthetic-temporary-dms","selector":"all_human_dms","operation":"send_message",
+              "peer_ids":[],"expires_at":200,"max_chars":100,"per_minute":1,"per_day":20}
+        p=self.v2(rules=[rule])
+        self.assertTrue(p.authorize(42,"x",frozenset({"telegram:send"}),199,
+                                    peer_type="user",is_human=True).active(199))
+        with self.assertRaises(Denied):p.precheck(42,"x",frozenset({"telegram:send"}),200)
+        with self.assertRaises(Denied):p.precheck(42,"x",frozenset({"telegram:read"}),199)
+
+    def test_global_send_quota_caps_multiple_recipients(self):
+        with tempfile.TemporaryDirectory() as d:
+            q=Quotas(Path(d)/"quota.sqlite")
+            first=Grant(42,None,100,10,100,global_per_minute=5,global_per_day=1)
+            second=Grant(43,None,100,10,100,global_per_minute=5,global_per_day=1)
+            q.reserve(first,100)
+            with self.assertRaises(Denied):q.reserve(second,101)
+            q.close()
+
 class ExtraWriteTests(unittest.IsolatedAsyncioTestCase):
     setUp = WriteTests.setUp
     tearDown = WriteTests.tearDown
@@ -254,3 +325,95 @@ class ExtraWriteTests(unittest.IsolatedAsyncioTestCase):
         result=await self.s.invoke("send_message",peer_id=42,text="test")
         self.assertEqual(result["error"],"send_denied")
         self.fake.send.assert_not_awaited()
+
+    async def test_bulk_human_rule_excludes_bots_and_groups(self):
+        self.s.policy=SecurityTests.v2(rules=[{"id":"synthetic-human-rule","operation":"send_message",
+            "selector":"all_human_dms","peer_ids":[],"expires_at":None,"max_chars":100,
+            "per_minute":1,"per_day":20}])
+        self.assertTrue((await self.s.invoke("send_message",peer_id=42,text="approved by user"))["sent"])
+        self.fake.send.reset_mock()
+        self.fake.human_user=False
+        self.assertEqual((await self.s.invoke("send_message",peer_id=43,text="approved by user"))["error"],"peer_not_human")
+        self.assertFalse(self.fake.send.await_count)
+        self.fake.human_user=True
+        self.fake.peer_type="group"
+        self.assertEqual((await self.s.invoke("send_message",peer_id=44,text="approved by user"))["error"],"send_denied")
+        self.assertFalse(self.fake.send.await_count)
+
+    async def test_selected_group_rule_rejects_other_peer_and_channel(self):
+        self.s.policy=SecurityTests.v2(rules=[{"id":"synthetic-selected-groups","operation":"send_message",
+            "selector":"group_ids","peer_ids":[-99],"expires_at":None,"max_chars":100,
+            "per_minute":1,"per_day":20}])
+        self.fake.peer_type="group"
+        self.assertTrue((await self.s.invoke("send_message",peer_id=-99,text="user instruction"))["sent"])
+        self.fake.send.reset_mock()
+        self.assertEqual((await self.s.invoke("send_message",peer_id=-98,text="user instruction"))["error"],"send_denied")
+        self.assertFalse(self.fake.send.await_count)
+        self.fake.peer_type="channel"
+        self.assertEqual((await self.s.invoke("send_message",peer_id=-99,text="user instruction"))["error"],"peer_mismatch")
+        self.assertFalse(self.fake.send.await_count)
+
+    async def test_first_contact_requires_verified_inbound_message_and_deduplicates(self):
+        self.s.policy=SecurityTests.v2(rules=[{"id":"synthetic-first-contact","operation":"send_message",
+            "selector":"first_contact","peer_ids":[],"expires_at":None,"max_chars":100,
+            "per_minute":1,"per_day":20}])
+        self.assertEqual((await self.s.invoke("send_message",peer_id=42,text="user instruction"))["error"],
+                         "first_contact_message_required")
+        self.assertEqual((await self.s.invoke("send_message",peer_id=42,text="user instruction",reply_to=9,
+                    first_contact_message_id=10))["error"],"invalid_first_contact_reference")
+        self.fake.first_inbound=False
+        self.assertEqual((await self.s.invoke("send_message",peer_id=42,text="user instruction",reply_to=10,
+                    first_contact_message_id=10))["error"],"first_contact_unverified")
+        self.fake.send.assert_not_awaited()
+        self.fake.first_inbound=True
+        result=await self.s.invoke("send_message",peer_id=42,text="user instruction",reply_to=10,
+                                   first_contact_message_id=10)
+        self.assertTrue(result["sent"])
+        duplicate=await self.s.invoke("send_message",peer_id=42,text="user instruction",reply_to=10,
+                                      first_contact_message_id=10)
+        self.assertEqual(duplicate["error"],"first_contact_already_handled")
+        self.assertEqual(self.fake.send.await_count,1)
+        self.assertEqual(self.q.db.execute("SELECT state FROM first_contact_attempts").fetchone()[0],"sent")
+
+    async def test_first_contact_unknown_delivery_is_terminal(self):
+        self.s.policy=SecurityTests.v2(rules=[{"id":"synthetic-first-contact","operation":"send_message",
+            "selector":"first_contact","peer_ids":[],"expires_at":None,"max_chars":100,
+            "per_minute":1,"per_day":20}])
+        self.fake.send.side_effect=TimeoutError("synthetic timeout")
+        result=await self.s.invoke("send_message",peer_id=42,text="user instruction",reply_to=10,
+                                   first_contact_message_id=10)
+        self.assertEqual(result["error"],"delivery_unknown")
+        replay=await self.s.invoke("send_message",peer_id=42,text="user instruction",reply_to=10,
+                                   first_contact_message_id=10)
+        self.assertEqual(replay["error"],"first_contact_already_handled")
+        self.assertEqual(self.fake.send.await_count,1)
+        self.assertEqual(self.q.db.execute("SELECT state FROM first_contact_attempts").fetchone()[0],"unknown")
+
+    async def test_first_contact_history_error_fails_closed(self):
+        self.s.policy=SecurityTests.v2(rules=[{"id":"synthetic-first-contact","operation":"send_message",
+            "selector":"first_contact","peer_ids":[],"expires_at":None,"max_chars":100,
+            "per_minute":1,"per_day":20}])
+        self.fake.verify_first_inbound=AsyncMock(side_effect=RuntimeError("synthetic history failure"))
+        result=await self.s.invoke("send_message",peer_id=42,text="user instruction",reply_to=10,
+                                   first_contact_message_id=10)
+        self.assertEqual(result["error"],"first_contact_unavailable")
+        self.fake.send.assert_not_awaited()
+        self.assertEqual(self.q.db.execute("SELECT COUNT(*) FROM first_contact_attempts").fetchone()[0],0)
+
+    async def test_first_contact_race_reserves_once_across_connections(self):
+        self.s.policy=SecurityTests.v2(rules=[{"id":"synthetic-first-contact","operation":"send_message",
+            "selector":"first_contact","peer_ids":[],"expires_at":None,"max_chars":100,
+            "per_minute":1,"per_day":20}])
+        barrier=asyncio.Barrier(2)
+        self.fake.first_contact_barrier=barrier
+        other_q=Quotas(self.path)
+        other=Service(self.fake,self.s.policy,other_q,gate=RateGate(limit=1000),clock=lambda:self.now)
+        args=dict(peer_id=42,text="user instruction",reply_to=10,first_contact_message_id=10)
+        try:
+            results=await asyncio.gather(self.s.invoke("send_message",**args),other.invoke("send_message",**args))
+            self.assertEqual(sum(bool(x.get("sent")) for x in results),1)
+            self.assertEqual(self.fake.send.await_count,1)
+            errors=[x.get("error") for x in results if x.get("error")]
+            self.assertEqual(errors,["first_contact_already_handled"])
+        finally:
+            other_q.close()

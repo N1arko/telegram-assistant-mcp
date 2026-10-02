@@ -5,8 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "telegram-assistant-mcp"
 version = "0.1.0"
-description = "Read-only personal Telegram MCP resource server"
-readme = "README.md"
+description = "Restricted personal Telegram MCP resource server"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 dependencies = ["mcp==1.26.0", "telethon==1.45.0", "PyJWT[crypto]==2.15.1"]
@@ -16,6 +15,7 @@ qr-login = ["qrcode==8.2"]
 
 [project.scripts]
 telegram-assistant-mcp = "telegram_assistant.server:main"
+telegram-assistant-policy = "telegram_assistant.policy_admin:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

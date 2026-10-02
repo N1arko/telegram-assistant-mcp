@@ -196,6 +196,39 @@ class TelethonBackend:
             raise Denied('peer_not_in_dialogs')
         return target, kind
 
+    async def is_human_user(self, target):
+        """Return true only for a resolved, non-bot, non-self Telegram user."""
+        entity = self.peers.get(target)
+        return (entity is not None and self.kind(entity) == "user" and
+                not getattr(entity, "bot", False) and not getattr(entity, "is_self", False) and
+                not getattr(entity, "min", False) and
+                not getattr(entity, "deleted", False))
+
+    async def verify_first_inbound(self, target, message_id):
+        """Bind first-contact eligibility to a real inbound message and current oldest history.
+
+        Telegram cannot reveal messages that were deleted remotely. This checks
+        only currently available history and fails closed if either lookup is
+        absent or malformed.
+        """
+        from telethon.utils import get_peer_id
+        entity = self.peers.get(target)
+        if (entity is None or self.kind(entity) != "user" or
+                getattr(entity, "bot", False) or getattr(entity, "is_self", False) or
+                getattr(entity, "min", False) or get_peer_id(entity) != target or
+                getattr(entity, "deleted", False)):
+            return False
+        message = await self.client.get_messages(entity, ids=message_id)
+        if (message is None or message.id != message_id or getattr(message, "out", True) or
+                getattr(message, "sender_id", None) != entity.id):
+            return False
+        earliest = await self.client.get_messages(entity, limit=1, reverse=True)
+        if not isinstance(earliest, (list, tuple)) or len(earliest) != 1:
+            return False
+        first = earliest[0]
+        return (first is not None and first.id == message_id and
+                not getattr(first, "out", True) and getattr(first, "sender_id", None) == entity.id)
+
     @staticmethod
     def record(message):
         from telethon.utils import get_peer_id

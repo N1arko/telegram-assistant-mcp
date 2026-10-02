@@ -1,0 +1,72 @@
+# Local send policy
+
+Message sending is disabled by default. The local operator policy is a technical
+barrier in addition to the assistant's check that a user's instruction is
+current and applies to the recipient and message. It does not encode semantic
+rules such as “reply only when someone asks about a meeting.” The policy editor
+is a local command-line tool; it is not exposed through MCP.
+
+## Policy file
+
+Use a policy file outside the source repository. Its parent directory and the
+file must belong to the current OS user and be private to that user. The editor
+rejects symlinks and policy paths inside a Git repository, and writes updates
+atomically. Never commit a live policy file.
+
+Start from `config/policy.example.json`. It has no grants or denials and sets a
+global ceiling of 5 sends per minute and 100 per day. Each recipient grant or
+rule defaults to 1 send per minute and 20 per day, with a 4,096 UTF-16-unit
+message limit. Limits combine conservatively: the lowest applicable ceiling
+wins.
+
+## Selectors and denials
+
+Version 2 policies support these selectors:
+
+- `peer`: one exact peer ID;
+- `all_human_dms`: human personal users, excluding bots and the account itself;
+- `group_ids`: only the listed group IDs;
+- `all_groups`: every eligible group, an intentionally broad rule;
+- `first_contact`: eligibility to reply to a specific verified first inbound
+  message from a human user.
+
+Broadcast channels, bots, and self are not eligible. An active exact-peer
+denial always overrides grants and selectors. With no active matching grant,
+sending is denied.
+
+`first_contact` only establishes eligibility. The send call must provide the
+same message ID as `reply_to`; the service verifies that it is an incoming
+message from that user and the oldest message currently available in that
+dialog. If history is incomplete or the check fails, sending is denied. Remote
+deletions cannot be proven, so this is a check of currently available history.
+An attempted first-contact reply is reserved before sending. Replays are
+blocked; an unknown delivery outcome must be checked manually and is not
+retried automatically.
+
+## Local commands
+
+After installing the project, use `telegram-assistant-policy` to inspect or
+edit the local policy. Replace the illustrative peer ID and timestamp below
+with values you have independently verified; omitting `--expires-at` makes a
+grant permanent.
+
+```sh
+telegram-assistant-policy --policy /secure/private/policy.json validate
+telegram-assistant-policy --policy /secure/private/policy.json grant-peer \
+  --peer-id 123456789 --expires-at 1893456000
+telegram-assistant-policy --policy /secure/private/policy.json deny-peer \
+  --peer-id 123456789
+telegram-assistant-policy --policy /secure/private/policy.json revoke-peer \
+  --peer-id 123456789
+```
+
+To grant a selector, use `grant-rule --selector` with one of the selector names
+above. Repeat `--peer-id` for each member of a `group_ids` rule. An
+`all_groups` rule covers every eligible group. Review that scope carefully
+before creating it. Use `revoke-rule --rule-id` to remove a rule. `allow-peer`
+removes an exact-peer denial; it does not create a grant. Use
+`set-global-quotas --per-minute N --per-day N` to change the global ceiling.
+
+The CLI prints only a generic success or failure result and writes the owner-
+only policy through an atomic replacement. No policy management tool is
+available to an MCP client.

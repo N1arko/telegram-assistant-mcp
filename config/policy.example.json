@@ -1,1 +1,10 @@
-{"version": 1, "grants": []}
+{
+  "version": 2,
+  "grants": [],
+  "rules": [],
+  "denies": [],
+  "global_limits": {
+    "per_minute": 5,
+    "per_day": 100
+  }
+}

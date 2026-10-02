@@ -50,3 +50,35 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.backend.send(42,"**test**",3),100)
         self.client.send_message.assert_awaited_once_with(self.backend.peers[42],"**test**",parse_mode=None,
                                                         link_preview=False,reply_to=3)
+
+    async def test_first_inbound_verifies_real_message_and_oldest_available_history(self):
+        user=User(id=42,first_name="Synthetic",bot=False)
+        self.backend._remember(user)
+        incoming=NS(id=7,out=False,sender_id=42)
+        self.client.get_messages.side_effect=[incoming,[incoming]]
+        self.assertTrue(await self.backend.is_human_user(42))
+        self.assertTrue(await self.backend.verify_first_inbound(42,7))
+        self.assertEqual(self.client.get_messages.await_args_list,
+                         [((user,),{"ids":7}),((user,),{"limit":1,"reverse":True})])
+
+    async def test_first_inbound_fails_closed_for_bots_outgoing_missing_or_older_history(self):
+        bot=User(id=42,first_name="Synthetic bot",bot=True)
+        self.backend._remember(bot)
+        self.assertFalse(await self.backend.is_human_user(42))
+        self.assertFalse(await self.backend.verify_first_inbound(42,7))
+        user=User(id=43,first_name="Synthetic",bot=False)
+        self.backend._remember(user)
+        outgoing=NS(id=7,out=True,sender_id=43)
+        self.client.get_messages.return_value=outgoing
+        self.assertFalse(await self.backend.verify_first_inbound(43,7))
+        incoming=NS(id=8,out=False,sender_id=43)
+        self.client.get_messages.side_effect=[incoming,[NS(id=2,out=True,sender_id=43)]]
+        self.assertFalse(await self.backend.verify_first_inbound(43,8))
+        self.client.get_messages.side_effect=[incoming,[]]
+        self.assertFalse(await self.backend.verify_first_inbound(43,8))
+
+    async def test_incomplete_user_entity_is_not_classified_as_human(self):
+        incomplete=User(id=44,first_name="Synthetic",bot=False,min=True)
+        self.backend.peers[44]=incomplete
+        self.assertFalse(await self.backend.is_human_user(44))
+        self.assertFalse(await self.backend.verify_first_inbound(44,8))

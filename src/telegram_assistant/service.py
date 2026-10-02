@@ -77,7 +77,7 @@ class Service:
                     return {"error": "telegram_rate_limited", "retry_after_seconds": seconds}
                 return {"error": "delivery_unknown" if operation == "send_message" else "telegram_unavailable"}
 
-    async def _resolve(self, target, *, allow_broadcast=False):
+    async def _resolve(self, target, *, allow_broadcast=False, return_type=False):
         target = validate_peer_id(target)
         allowed_peer_id = (self.read_only_broadcast_channel[0]
                            if self.read_only_broadcast_channel is not None else None)
@@ -91,10 +91,10 @@ class Service:
         if target == allowed_peer_id:
             if not allow_broadcast or resolved[1] != "broadcast_channel":
                 raise Denied("peer_mismatch")
-            return target
+            return (target, resolved[1]) if return_type else target
         if resolved[1] not in {"user", "group"}:
             raise Denied("peer_mismatch")
-        return target
+        return (target, resolved[1]) if return_type else target
 
     async def list_dialogs(self, archived=None, limit=20, cursor=None):
         integer(limit, 1, 50)
@@ -223,19 +223,56 @@ class Service:
             payload["context_truncated"] = True
         return payload
 
-    async def send_message(self, peer_id, text, reply_to=None):
+    async def send_message(self, peer_id, text, reply_to=None, first_contact_message_id=None):
         target = validate_peer_id(peer_id)
         if reply_to is not None:
             integer(reply_to, 1, 2**31 - 1)
-        # Deny before resolving or touching Telegram.
-        grant = self.policy.authorize(target, text, SCOPES.get(), self.clock())
+        if first_contact_message_id is not None:
+            integer(first_contact_message_id, 1, 2**31 - 1)
+        # A broad selector is only a candidate until peer class is resolved.
+        # Explicit denies and default-deny still stop before contacting Telegram.
+        candidates = self.policy.precheck(target, text, SCOPES.get(), self.clock())
+        first_rules = tuple(g for g in candidates if g.first_contact)
+        if first_contact_message_id is None:
+            if first_rules and not any(not g.first_contact for g in candidates):
+                raise Denied("first_contact_message_required")
+        elif not first_rules or reply_to != first_contact_message_id:
+            raise Denied("invalid_first_contact_reference")
         if self.quotas is None:
             raise Denied("send_denied")
-        await self._resolve(target)
-        if reply_to is not None and await self.backend.message(target, reply_to) is None:
+        target, peer_type = await self._resolve(target, return_type=True)
+        needs_human = any(g.selector in {"all_human_dms", "first_contact"} for g in candidates)
+        is_human = False
+        if needs_human:
+            check_human = getattr(self.backend, "is_human_user", None)
+            is_human = bool(check_human and await check_human(target))
+            if not is_human:
+                raise Denied("peer_not_human")
+        first_contact_verified = False
+        if first_rules and first_contact_message_id is not None:
+            verify = getattr(self.backend, "verify_first_inbound", None)
+            try:
+                first_contact_verified = bool(verify and await verify(target, first_contact_message_id))
+            except Exception as exc:
+                if type(exc).__name__ in {"FloodWaitError", "SlowModeWaitError", "FloodPremiumWaitError"}:
+                    raise
+                raise Denied("first_contact_unavailable") from None
+            if not first_contact_verified:
+                raise Denied("first_contact_unverified")
+        if reply_to is not None and not first_contact_verified and await self.backend.message(target, reply_to) is None:
             raise Denied("reply_target_missing")
         # Recheck expiry after async resolution and reserve transactionally.
-        self.policy.authorize(target, text, SCOPES.get(), self.clock())
-        self.quotas.reserve(grant, self.clock())
-        result = await self.backend.send(target, text, reply_to)
+        grant = self.policy.authorize(target, text, SCOPES.get(), self.clock(),
+                                      peer_type=peer_type, is_human=is_human,
+                                      first_contact_verified=first_contact_verified)
+        self.quotas.reserve(grant, self.clock(),
+                            first_contact_message_id=first_contact_message_id if grant.first_contact else None)
+        try:
+            result = await self.backend.send(target, text, reply_to)
+        except BaseException:
+            if grant.first_contact and first_contact_message_id is not None:
+                self.quotas.finish_first_contact(target, first_contact_message_id, "unknown")
+            raise
+        if grant.first_contact and first_contact_message_id is not None:
+            self.quotas.finish_first_contact(target, first_contact_message_id, "sent")
         return {"sent": True, "peer_id": target, "message_id": result}

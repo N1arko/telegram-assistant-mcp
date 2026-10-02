@@ -199,11 +199,16 @@ def build_mcp(service, config, verifier, *, read_only=False):
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False,
         openWorldHint=True), meta={"securitySchemes": [{"type": "oauth2", "scopes": ["telegram:read", "telegram:send"]}]})
-    async def send_message(peer_id: StrictID, text: StrictText, reply_to: StrictID | None = None) -> CallToolResult:
+    async def send_message(peer_id: StrictID, text: StrictText, reply_to: StrictID | None = None,
+                           first_contact_message_id: StrictID | None = None) -> CallToolResult:
         """Plain-text send. Requires user semantic permission, write scope and separate operator grant; default denied.
-        Only exact marked numeric peer ID. No permission-management tool. Never retry unknown delivery automatically.
+        Policy may select an exact peer, human direct chats, or groups. First-contact eligibility must reference the
+        exact incoming first message as both reply_to and first_contact_message_id; the server verifies currently
+        available history. This is not an automation trigger or content permission. No permission-management tool.
+        Never retry unknown delivery automatically.
         """
-        return await call("send_message", peer_id=peer_id, text=text, reply_to=reply_to)
+        return await call("send_message", peer_id=peer_id, text=text, reply_to=reply_to,
+                          first_contact_message_id=first_contact_message_id)
 
     return mcp
 
