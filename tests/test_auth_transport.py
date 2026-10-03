@@ -310,6 +310,40 @@ class MiddlewareTests(unittest.IsolatedAsyncioTestCase):
         await RequestLimits(app)({"type":"http","path":"/mcp","method":"POST","headers":[]},receive_nonmedia,send)
         self.assertEqual(sent[0]["status"],413)
 
+    async def test_send_media_body_accepts_exact_transport_limit_and_rejects_one_byte_over(self):
+        from telegram_assistant.server import MAX_REQUEST_BYTES
+        prefix=(b'{"jsonrpc":"2.0","id":1,"method":"tools/call",'
+                b'"params":{"name":"send_media","arguments":{"data_base64":"')
+        suffix=b'"}}}'
+        def body_of_size(size):
+            padding=size-len(prefix)-len(suffix)
+            if padding < 0:
+                raise AssertionError("test body too small")
+            return prefix+b'A'*padding+suffix
+
+        delivered=[]
+        async def app(scope,receive,send):
+            delivered.append(len((await receive())["body"]))
+            await send({"type":"http.response.start","status":200,"headers":[]})
+            await send({"type":"http.response.body","body":b'{}'})
+        async def call(body):
+            events=[]
+            async def receive():
+                return {"type":"http.request","body":body,"more_body":False}
+            async def send(event): events.append(event)
+            await RequestLimits(app)({"type":"http","path":"/mcp","method":"POST","headers":[]},receive,send)
+            return events
+
+        at_limit=body_of_size(MAX_REQUEST_BYTES)
+        accepted=await call(at_limit)
+        self.assertEqual(accepted[0]["status"],200)
+        self.assertEqual(delivered,[MAX_REQUEST_BYTES])
+        at_limit=None
+        over_limit=body_of_size(MAX_REQUEST_BYTES+1)
+        rejected=await call(over_limit)
+        self.assertEqual(rejected[0]["status"],413)
+        self.assertEqual(delivered,[MAX_REQUEST_BYTES])
+
     async def test_no_tracebacks_or_oversize_from_app(self):
         async def broken(scope,receive,send):
             raise RuntimeError("TOKEN_AND_TEXT_SECRET")
