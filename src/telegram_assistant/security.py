@@ -233,6 +233,50 @@ class Policy:
             raise Denied("text_too_long")
         return candidates
 
+    def precheck_media(self, target, captions, scopes, now):
+        if "telegram:send" not in scopes:
+            raise Denied("send_scope_required")
+        candidates = tuple(g for g in self.candidates(target, now) if not g.first_contact)
+        if not candidates:
+            raise Denied("send_denied")
+        if not isinstance(captions, (list, tuple)):
+            raise Denied("invalid_media_caption")
+        for caption in captions:
+            if caption is None:
+                continue
+            if not isinstance(caption, str):
+                raise Denied("invalid_media_caption")
+            try:
+                units = len(caption.encode("utf-16-le")) // 2
+            except UnicodeError:
+                raise Denied("invalid_media_caption") from None
+            if units > min(g.max_chars for g in candidates):
+                raise Denied("text_too_long")
+        return candidates
+
+    def authorize_media(self, target: int, captions, scopes: frozenset[str], now: float, *,
+                        peer_type=None, is_human=False) -> Grant:
+        candidates = self.precheck_media(target, captions, scopes, now)
+        matched = []
+        for grant in candidates:
+            if grant.selector == "peer" and (
+                    peer_type == "group" or (peer_type == "user" and is_human)):
+                matched.append(grant)
+            elif grant.selector == "all_human_dms" and peer_type == "user" and is_human:
+                matched.append(grant)
+            elif grant.selector in {"group_ids", "all_groups"} and peer_type == "group":
+                matched.append(grant)
+        if not matched:
+            raise Denied("send_denied")
+        for caption in captions:
+            if caption is not None and len(caption.encode("utf-16-le")) // 2 > min(g.max_chars for g in matched):
+                raise Denied("text_too_long")
+        expiry = None if any(g.expires_at is None for g in matched) else max(g.expires_at for g in matched)
+        return Grant(target, expiry, min(g.max_chars for g in matched),
+                     min(g.per_minute for g in matched), min(g.per_day for g in matched),
+                     selector="combined", rule_id=",".join(sorted(g.rule_id for g in matched if g.rule_id)) or None,
+                     global_per_minute=self.global_per_minute, global_per_day=self.global_per_day)
+
     def authorize(self, target: int, text: str, scopes: frozenset[str], now: float, *,
                   peer_type=None, is_human=False, first_contact_verified=False) -> Grant:
         candidates = self.precheck(target, text, scopes, now)
@@ -297,7 +341,8 @@ class Quotas:
                         (json.dumps(state, allow_nan=False, separators=(',', ':')),))
         self.db.commit()
 
-    def reserve(self, grant: Grant, now: float, *, first_contact_message_id=None):
+    def reserve(self, grant: Grant, now: float, *, first_contact_message_id=None, count=1):
+        integer(count, 1, 10, "send_quota_exceeded")
         self.db.execute("BEGIN IMMEDIATE")
         try:
             # A rolling 24-hour limit; no reset-at-midnight burst.
@@ -313,13 +358,14 @@ class Quotas:
             rows = self.db.execute("SELECT at FROM attempts WHERE peer=? AND at>? ORDER BY at",
                                    (grant.peer_id, now - 86400)).fetchall()
             recent = [at for (at,) in rows if at > now - 60]
-            if len(rows) >= grant.per_day or len(recent) >= grant.per_minute:
+            if len(rows) + count > grant.per_day or len(recent) + count > grant.per_minute:
                 raise Denied("send_quota_exceeded")
             all_rows = self.db.execute("SELECT at FROM attempts WHERE at>? ORDER BY at", (now - 86400,)).fetchall()
             all_recent = [at for (at,) in all_rows if at > now - 60]
-            if len(all_rows) >= grant.global_per_day or len(all_recent) >= grant.global_per_minute:
+            if len(all_rows) + count > grant.global_per_day or len(all_recent) + count > grant.global_per_minute:
                 raise Denied("send_quota_exceeded")
-            self.db.execute("INSERT INTO attempts VALUES (?, ?)", (grant.peer_id, now))
+            self.db.executemany("INSERT INTO attempts VALUES (?, ?)",
+                                ((grant.peer_id, now) for _ in range(count)))
             self.db.commit()
         except BaseException:
             self.db.rollback()

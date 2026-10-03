@@ -2,7 +2,7 @@
 
 **English | [Русский](SENDING-POLICY.ru.md)**
 
-Message sending is disabled by default. The local operator policy is a technical
+Text and media sending are disabled by default. The local operator policy is a technical
 barrier in addition to the assistant's check that a user's instruction is
 current and applies to the recipient and message. It does not encode semantic
 rules such as “reply only when someone asks about a meeting.” The policy editor
@@ -36,6 +36,22 @@ Version 2 policies support these selectors:
 Broadcast channels, bots, and self are not eligible. An active exact-peer
 denial always overrides grants and selectors. With no active matching grant,
 sending is denied.
+
+The same existing `send_message` grants also authorize `send_media`; no separate
+grant format or OAuth scope is introduced. First-contact-only grants cannot send
+media. `send_media` accepts one attachment or a 2–10 item photo/video album. It
+checks each caption against the same `max_chars` grant and charges one rate/daily
+quota unit for every resulting Telegram message. Failed sends still consume the
+reserved quota. An uncertain result must be checked manually and never retried.
+
+Supported single items are JPEG/PNG photos, MP4/WebM videos, documents, MP3,
+MP4/M4A, WAV, WebM, or OGG/Opus audio, OGG/Opus voice notes, GIF animations,
+and static WebP stickers. Per call, binary data is capped
+at 20 MiB; photo input is at most 8 MiB and 12 megapixels; video/GIF frames are
+at most 12 megapixels; audio, voice, video, and GIFs are at most five minutes.
+Stickers are static WebP up to 512 KiB and
+512×512 pixels. Media is supplied inline as base64 by the MCP client and held
+only in a private temporary directory while sending.
 
 `first_contact` only establishes eligibility. The send call must provide the
 same message ID as `reply_to`; the service verifies that it is an incoming

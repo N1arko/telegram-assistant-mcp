@@ -179,7 +179,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code,200,response.text)
         names={t["name"] for t in response.json()["result"]["tools"]}
         self.assertEqual(names,{"list_dialogs","get_history","search_messages","get_reply_context",
-                               "view_photo","transcribe_audio","send_message"})
+                               "view_photo","transcribe_audio","send_message","send_media"})
         for name in ["set_policy","edit_message","delete_message","mark_as_read","download_media","transcribe_voice"]:
             result=await self.rpc("tools/call",{"name":name,"arguments":{}})
             self.assertTrue(result.json()["result"]["isError"])
@@ -224,7 +224,34 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             response=await self.rpc("tools/call",{"name":"send_message","arguments":{"peer_id":42,"text":"test"}},token=token)
             self.assertEqual(json.loads(response.json()["result"]["content"][0]["text"])["error"],code)
         self.fake.send.assert_not_awaited()
+        for token,code in [("fake-read","send_scope_required"),("fake-write","send_denied")]:
+            response=await self.rpc("tools/call",{"name":"send_media","arguments":{
+                "peer_id":42,"items":[{"media_type":"document","data_base64":"eA=="}]}},token=token)
+            self.assertEqual(json.loads(response.json()["result"]["content"][0]["text"])["error"],code)
+        self.fake.send_media_files.assert_not_awaited()
         self.assertEqual(self.jwks_calls,1)  # Public-key cache; signatures/claims checked each request.
+
+    async def test_send_media_tool_uses_inline_base64_and_existing_write_scope(self):
+        import base64, tempfile
+        from pathlib import Path
+        from telegram_assistant.security import Grant, Policy, Quotas
+        temporary=tempfile.TemporaryDirectory()
+        quotas=Quotas(Path(temporary.name)/"quotas.sqlite")
+        self.service.quotas=quotas
+        self.service.policy=Policy([Grant(42, int(time.time())+300, 100, 1, 2)])
+        self.fake.send_media_files.return_value=[88]
+        response=await self.rpc("tools/call",{"name":"send_media","arguments":{
+            "peer_id":42,"items":[{"media_type":"document","filename":"note.pdf",
+                "caption":"inline bytes","data_base64":base64.b64encode(
+                    b"%PDF-1.7\n"+b"synthetic-"*5000).decode()}]}},token="fake-write")
+        self.assertEqual(response.status_code,200,response.text[:300])
+        result=response.json()["result"]
+        payload=json.loads(result["content"][0]["text"])
+        self.assertEqual(payload["message_ids"],[88])
+        self.assertEqual(payload["media_count"],1)
+        self.fake.send_media_files.assert_awaited_once()
+        quotas.close()
+        temporary.cleanup()
     async def test_strict_numeric_peer(self):
         for peer in [True,"42","@name"]:
             response=await self.rpc("tools/call",{"name":"get_history","arguments":{"peer_id":peer}})
@@ -259,6 +286,30 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MiddlewareTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_send_media_may_use_large_request_body(self):
+        body=json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"send_media","arguments":{"filler":"x"*70000}}}).encode()
+        received=[]
+        async def app(scope,receive,send):
+            received.append((await receive())["body"])
+            await send({"type":"http.response.start","status":200,"headers":[]})
+            await send({"type":"http.response.body","body":b"ok"})
+        async def receive():
+            return {"type":"http.request","body":body,"more_body":False}
+        sent=[]
+        async def send(event): sent.append(event)
+        await RequestLimits(app)({"type":"http","path":"/mcp","method":"POST","headers":[]},receive,send)
+        self.assertEqual(received,[body])
+        self.assertEqual(sent[0]["status"],200)
+
+        body=json.dumps({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"get_history","arguments":{"filler":"x"*70000}}}).encode()
+        async def receive_nonmedia():
+            return {"type":"http.request","body":body,"more_body":False}
+        sent=[]
+        await RequestLimits(app)({"type":"http","path":"/mcp","method":"POST","headers":[]},receive_nonmedia,send)
+        self.assertEqual(sent[0]["status"],413)
+
     async def test_no_tracebacks_or_oversize_from_app(self):
         async def broken(scope,receive,send):
             raise RuntimeError("TOKEN_AND_TEXT_SECRET")

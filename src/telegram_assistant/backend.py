@@ -1,4 +1,4 @@
-"""Telethon adapter: only explicit reads and a guarded plain-text send."""
+"""Telethon adapter: explicit reads and policy-guarded text/media sends."""
 from __future__ import annotations
 
 import time
@@ -350,3 +350,54 @@ class TelethonBackend:
         result = await self.client.send_message(self.peers[target], text, parse_mode=None,
                                                 link_preview=False, reply_to=reply_to)
         return result.id
+
+    async def send_media_files(self, target, files, reply_to):
+        """Send prepared local files; the service owns and removes their temp directory."""
+        from telethon import types
+
+        await self.activate()
+        entity = self.peers[target]
+        captions = [item.caption or "" for item in files]
+        if len(files) > 1:
+            # Telethon's album path supports photos and videos and applies one
+            # caption per item. Documents/stickers are deliberately excluded by
+            # Service.send_media because Telethon emits them outside albums.
+            result = await self.client.send_file(
+                entity, [item.path for item in files], caption=captions,
+                reply_to=reply_to, parse_mode=None,
+                supports_streaming=any(item.media_type == "video" for item in files))
+        else:
+            item = files[0]
+            attributes = [types.DocumentAttributeFilename(item.filename)]
+            kwargs = {
+                "caption": captions[0], "reply_to": reply_to, "parse_mode": None,
+                "force_document": item.media_type in {"document", "animation", "sticker"},
+                "mime_type": item.mime_type, "attributes": attributes,
+                "supports_streaming": item.media_type == "video",
+                "nosound_video": item.media_type == "animation",
+            }
+            if item.media_type == "video":
+                attributes.append(types.DocumentAttributeVideo(
+                    duration=max(1, int(item.duration or 1)), w=item.width, h=item.height,
+                    supports_streaming=True,
+                    nosound=not item.has_audio))
+            elif item.media_type in {"audio", "voice"}:
+                attributes.append(types.DocumentAttributeAudio(
+                    duration=max(1, int(item.duration or 1)), voice=item.voice))
+                kwargs["voice_note"] = item.voice
+            elif item.media_type == "animation":
+                attributes.append(types.DocumentAttributeAnimated())
+            elif item.media_type == "sticker":
+                attributes.append(types.DocumentAttributeSticker(
+                    alt=item.sticker_emoji, stickerset=types.InputStickerSetEmpty()))
+            result = await self.client.send_file(entity, item.path, **kwargs)
+
+        messages = result if isinstance(result, (list, tuple)) else [result]
+        ids = []
+        for message in messages:
+            message_id = getattr(message, "id", None)
+            if type(message_id) is not int:
+                # The RPC may have succeeded while its result was malformed.
+                raise RuntimeError("media_delivery_unknown")
+            ids.append(message_id)
+        return ids

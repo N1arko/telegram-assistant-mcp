@@ -21,12 +21,17 @@ class ReadOnlyTransportTests(unittest.IsolatedAsyncioTestCase):
             {'list_dialogs','get_history','search_messages','get_reply_context','view_photo','transcribe_audio'})
         self.assertTrue(all(t['annotations']['readOnlyHint'] for t in tools))
 
-    async def test_send_absent_even_for_valid_owner_with_write_scope(self):
+    async def test_both_send_tools_absent_even_for_valid_owner_with_write_scope(self):
         response = await self.rpc('tools/call',{'name':'send_message',
             'arguments':{'peer_id':42,'text':'fake-only'}},token='fake-write')
         self.assertEqual(response.status_code,200)
         self.assertTrue(response.json()['result']['isError'])
+        response = await self.rpc('tools/call',{'name':'send_media',
+            'arguments':{'peer_id':42,'items':[{'media_type':'document','data_base64':'eA=='}]}},token='fake-write')
+        self.assertEqual(response.status_code,200)
+        self.assertTrue(response.json()['result']['isError'])
         self.fake.send.assert_not_awaited()
+        self.fake.send_media_files.assert_not_awaited()
 
     async def test_no_token_invalid_and_wrong_owner_never_reach_backend(self):
         for token in [None,'invalid',base.signed(base.claims(sub='other-owner'))]:

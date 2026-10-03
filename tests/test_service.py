@@ -23,6 +23,7 @@ class Fake:
         self.rows += [{"peer_id": -99, "type": "group", "title": "group", "archived": True, "unread": 2},
                       {"peer_id": -100999, "type": "channel", "title": "channel", "archived": False, "unread": 0}]
         self.send = AsyncMock(return_value=99)
+        self.send_media_files = AsyncMock(return_value=[101])
         self.read_receipt = AsyncMock()
         self.download_media = AsyncMock()
         self.history_calls = []

@@ -3,16 +3,18 @@ import time
 from datetime import datetime, timezone
 from types import SimpleNamespace as NS
 from unittest.mock import AsyncMock
+from pathlib import Path
 
 from telethon.tl.types import User, Chat, Channel, InputPeerUser, PeerUser, Message, MessageReplyHeader
 from telegram_assistant.backend import TelethonBackend
 from telegram_assistant.security import Denied
+from telegram_assistant.media import OutboundMediaFile
 
 
 class BackendTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.client = NS(get_dialogs=AsyncMock(),get_messages=AsyncMock(),get_input_entity=AsyncMock(),
-                         send_message=AsyncMock(),send_read_acknowledge=AsyncMock(),download_media=AsyncMock())
+                         send_message=AsyncMock(),send_file=AsyncMock(),send_read_acknowledge=AsyncMock(),download_media=AsyncMock())
         self.backend=TelethonBackend(self.client)
     async def test_archive_and_marked_ids_and_membership(self):
         user=User(id=42,first_name="Test")
@@ -50,6 +52,39 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.backend.send(42,"**test**",3),100)
         self.client.send_message.assert_awaited_once_with(self.backend.peers[42],"**test**",parse_mode=None,
                                                         link_preview=False,reply_to=3)
+
+    async def test_media_album_uses_only_photo_video_local_files(self):
+        self.backend.peers={42:User(id=42)}
+        self.client.send_file.return_value=[NS(id=101), NS(id=102)]
+        files=[OutboundMediaFile(Path("/private/a.jpg"),"photo","image/jpeg","a.jpg",None),
+               OutboundMediaFile(Path("/private/b.mp4"),"video","video/mp4","b.mp4","clip",
+                                 duration=4,width=320,height=240,has_audio=True)]
+        self.assertEqual(await self.backend.send_media_files(42,files,7),[101,102])
+        self.client.send_file.assert_awaited_once_with(self.backend.peers[42],
+            [Path("/private/a.jpg"),Path("/private/b.mp4")],caption=["","clip"],reply_to=7,
+            parse_mode=None,supports_streaming=True)
+
+    async def test_voice_and_sticker_have_required_telegram_attributes(self):
+        from telethon import types
+        self.backend.peers={42:User(id=42)}
+        self.client.send_file.return_value=NS(id=103)
+        voice=OutboundMediaFile(Path("/private/voice.ogg"),"voice","audio/ogg","voice.ogg",None,
+                                duration=3,voice=True)
+        self.assertEqual(await self.backend.send_media_files(42,[voice],None),[103])
+        voice_kwargs=self.client.send_file.await_args.kwargs
+        audio=next(a for a in voice_kwargs["attributes"] if isinstance(a,types.DocumentAttributeAudio))
+        self.assertTrue(audio.voice)
+        self.assertTrue(voice_kwargs["voice_note"])
+
+        self.client.send_file.reset_mock()
+        self.client.send_file.return_value=NS(id=104)
+        sticker=OutboundMediaFile(Path("/private/sticker.webp"),"sticker","image/webp","sticker.webp",None,
+                                  sticker_emoji="🙂",width=512,height=512)
+        self.assertEqual(await self.backend.send_media_files(42,[sticker],None),[104])
+        sticker_kwargs=self.client.send_file.await_args.kwargs
+        attribute=next(a for a in sticker_kwargs["attributes"] if isinstance(a,types.DocumentAttributeSticker))
+        self.assertEqual(attribute.alt,"🙂")
+        self.assertIsInstance(attribute.stickerset,types.InputStickerSetEmpty)
 
     async def test_first_inbound_verifies_real_message_and_oldest_available_history(self):
         user=User(id=42,first_name="Synthetic",bot=False)

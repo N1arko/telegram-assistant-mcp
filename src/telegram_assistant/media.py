@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
+import codecs
 import json
 import math
+import mimetypes
 import os
+import re
 import shutil
 import tempfile
 import time
+import unicodedata
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,6 +26,12 @@ MAX_IMAGE_PREVIEW_EDGE = 1280
 MAX_IMAGE_PREVIEW_BYTES = 256 * 1024
 MAX_AUDIO_INPUT_BYTES = 20 * 1024 * 1024
 MAX_AUDIO_SECONDS = 300
+MAX_OUTBOUND_MEDIA_BYTES = 20 * 1024 * 1024
+MAX_OUTBOUND_PHOTO_BYTES = 8 * 1024 * 1024
+MAX_OUTBOUND_STICKER_BYTES = 512 * 1024
+MAX_OUTBOUND_ITEMS = 10
+MAX_OUTBOUND_CAPTION_UNITS = 1024
+MAX_OUTBOUND_MEDIA_SECONDS = 300
 MAX_MEDIA_RESPONSE_BYTES = 512 * 1024
 MAX_TRANSCRIPTION_RESPONSE_BYTES = 64 * 1024
 MAX_TRANSCRIPT_CHARS = 12_000
@@ -35,6 +47,304 @@ _OPENAI_MODEL = "gpt-4o-mini-transcribe"
 class ImageResult:
     data: bytes
     mime_type: str = "image/jpeg"
+
+
+@dataclass(frozen=True)
+class OutboundMediaFile:
+    path: Path
+    media_type: str
+    mime_type: str
+    filename: str
+    caption: str | None
+    sticker_emoji: str | None = None
+    duration: float | None = None
+    width: int | None = None
+    height: int | None = None
+    voice: bool = False
+    has_audio: bool = False
+
+
+def _utf16_units(value: str) -> int:
+    try:
+        return len(value.encode("utf-16-le")) // 2
+    except UnicodeError:
+        raise Denied("invalid_media_caption") from None
+
+
+def _safe_outbound_filename(value, extension: str) -> str:
+    if value is None:
+        value = "attachment"
+    if (not isinstance(value, str) or not value or len(value) > 255 or
+            "/" in value or "\\" in value or any(ord(char) < 32 for char in value)):
+        raise Denied("invalid_media_filename")
+    normalized = unicodedata.normalize("NFKC", value)
+    suffix = Path(normalized).suffix
+    stem = normalized[:-len(suffix)] if suffix else normalized
+    stem = re.sub(r"[^\w .()\-]", "_", stem, flags=re.UNICODE).strip(" .")[:100]
+    if not stem or stem in {".", ".."}:
+        raise Denied("invalid_media_filename")
+    return f"{stem}{extension}"
+
+
+def _write_private_file(directory: Path, filename: str, data: bytes) -> Path:
+    path = directory / filename
+    try:
+        with path.open("xb") as output:
+            os.fchmod(output.fileno(), 0o600)
+            output.write(data)
+    except OSError:
+        raise Denied("media_tempfile_unavailable") from None
+    return path
+
+
+def _probe_media_streams(info: dict, *, require_video: bool, allow_audio: bool) -> tuple[dict, float]:
+    streams = info.get("streams")
+    if not isinstance(streams, list) or not streams:
+        raise Denied("invalid_media")
+    videos = [s for s in streams if isinstance(s, dict) and s.get("codec_type") == "video"]
+    audios = [s for s in streams if isinstance(s, dict) and s.get("codec_type") == "audio"]
+    if (len(videos) != (1 if require_video else 0) or len(audios) > (1 if allow_audio else 0) or
+            len(videos) + len(audios) != len(streams)):
+        raise Denied("unsupported_media_format")
+    duration = _duration(info)
+    if duration > MAX_OUTBOUND_MEDIA_SECONDS:
+        raise Denied("media_too_long")
+    stream = videos[0] if videos else audios[0]
+    width, height = stream.get("width"), stream.get("height")
+    if require_video:
+        if (type(width) is not int or type(height) is not int or width <= 0 or height <= 0 or
+                width * height > MAX_IMAGE_PIXELS):
+            raise Denied("image_too_many_pixels")
+    return stream, duration
+
+
+async def prepare_outbound_media(item, directory: Path, *, remaining_bytes: int) -> OutboundMediaFile:
+    """Decode one MCP base64 attachment to an owner-only temp file and verify its bytes."""
+    if not isinstance(item, dict):
+        raise Denied("invalid_media")
+    media_type = item.get("media_type")
+    if not isinstance(media_type, str) or media_type not in {
+            "photo", "video", "document", "audio", "voice", "animation", "sticker"}:
+        raise Denied("unsupported_media_type")
+    encoded = item.get("data_base64")
+    if type(encoded) is not str or not encoded or len(encoded) > ((min(remaining_bytes, MAX_OUTBOUND_MEDIA_BYTES) + 2) // 3) * 4:
+        raise Denied("media_too_large" if type(encoded) is str else "invalid_media")
+    try:
+        raw = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except (UnicodeEncodeError, binascii.Error, ValueError):
+        raise Denied("invalid_media_base64") from None
+    if not raw or len(raw) > remaining_bytes or len(raw) > MAX_OUTBOUND_MEDIA_BYTES:
+        raise Denied("media_too_large")
+    caption = item.get("caption")
+    if caption is not None and (not isinstance(caption, str) or _utf16_units(caption) > MAX_OUTBOUND_CAPTION_UNITS):
+        raise Denied("invalid_media_caption")
+    supplied_name = item.get("filename")
+    if supplied_name is not None and (not isinstance(supplied_name, str) or not supplied_name or
+                                      len(supplied_name) > 255 or "/" in supplied_name or
+                                      "\\" in supplied_name or any(ord(char) < 32 for char in supplied_name)):
+        raise Denied("invalid_media_filename")
+    emoji = item.get("sticker_emoji")
+    if media_type == "sticker":
+        if (not isinstance(emoji, str) or not 1 <= len(emoji) <= 8 or
+                any(ord(char) < 32 for char in emoji) or
+                not any(unicodedata.category(char) in {"So", "Sk"} for char in emoji) or
+                caption is not None):
+            raise Denied("invalid_sticker")
+        if len(raw) > MAX_OUTBOUND_STICKER_BYTES:
+            raise Denied("media_too_large")
+        if sniff_image_mime_path_bytes(raw) != "image/webp":
+            raise Denied("unsupported_sticker_format")
+        if _webp_is_animated(raw):
+            raise Denied("animated_stickers_unsupported")
+        ext, mime_type = ".webp", "image/webp"
+    elif emoji is not None:
+        raise Denied("invalid_sticker")
+    elif media_type == "photo":
+        if len(raw) > MAX_OUTBOUND_PHOTO_BYTES:
+            raise Denied("media_too_large")
+        mime_type = sniff_image_mime_path_bytes(raw)
+        # Telethon's pinned MTProto client uploads only JPEG/PNG as photos;
+        # a static WebP file is supported separately as a sticker or document.
+        if mime_type not in {"image/jpeg", "image/png"}:
+            raise Denied("unsupported_image_format")
+        ext = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[mime_type]
+    elif media_type == "animation":
+        if sniff_image_mime_path_bytes(raw) != "image/gif":
+            raise Denied("unsupported_animation_format")
+        ext, mime_type = ".gif", "image/gif"
+    elif media_type == "video":
+        if len(raw) > MAX_OUTBOUND_MEDIA_BYTES:
+            raise Denied("media_too_large")
+        ext, mime_type = (".mp4", "video/mp4") if len(raw) >= 12 and raw[4:8] == b"ftyp" else (".webm", "video/webm")
+        if mime_type == "video/webm" and not _is_webm(raw[:4096]):
+            raise Denied("unsupported_video_format")
+    elif media_type in {"audio", "voice"}:
+        if len(raw) > MAX_AUDIO_INPUT_BYTES:
+            raise Denied("media_too_large")
+        kind = sniff_audio_kind_bytes(raw)
+        if media_type == "voice" and kind != "ogg-opus":
+            raise Denied("unsupported_voice_format")
+        ext, mime_type = {
+            "ogg-opus": (".ogg", "audio/ogg"), "mp3": (".mp3", "audio/mpeg"),
+            "mp4": (".m4a", "audio/mp4"), "wav": (".wav", "audio/wav"),
+            "webm": (".webm", "audio/webm"),
+        }[kind]
+    else:
+        mime_type = _document_mime_from_bytes(raw)
+        filename = _document_filename_from_bytes(raw, item.get("filename"), mime_type)
+        path = _write_private_file(directory, filename, raw)
+        return OutboundMediaFile(path, media_type, mime_type, filename, caption)
+
+    filename = _safe_outbound_filename(item.get("filename"), ext)
+    path = _write_private_file(directory, filename, raw)
+    duration = width = height = None
+    has_audio = False
+    if media_type in {"photo", "sticker"}:
+        info = await _probe(path, image=True)
+        streams = info.get("streams")
+        if (not isinstance(streams, list) or len(streams) != 1 or
+                not isinstance(streams[0], dict) or streams[0].get("codec_type") != "video"):
+            raise Denied("invalid_media")
+        stream = streams[0]
+        width, height = stream.get("width"), stream.get("height")
+        if (type(width) is not int or type(height) is not int or width <= 0 or height <= 0 or
+                width * height > MAX_IMAGE_PIXELS):
+            raise Denied("image_too_many_pixels")
+        if media_type == "sticker" and (width > 512 or height > 512):
+            raise Denied("sticker_dimensions_exceeded")
+    elif media_type in {"video", "animation"}:
+        info = await _probe(path, image=True)
+        stream, duration = _probe_media_streams(info,
+            require_video=True,
+            allow_audio=media_type == "video")
+        width, height = stream.get("width"), stream.get("height")
+        has_audio = any(isinstance(stream, dict) and stream.get("codec_type") == "audio"
+                        for stream in info.get("streams", []))
+    elif media_type in {"audio", "voice"}:
+        kind = sniff_audio_kind(path)
+        duration, _, _ = await _verified_audio(path, kind, MAX_AUDIO_SECONDS)
+    return OutboundMediaFile(path, media_type, mime_type, filename, caption,
+                             sticker_emoji=emoji, duration=duration,
+                             width=width, height=height, voice=media_type == "voice",
+                             has_audio=has_audio)
+
+
+def sniff_image_mime_path_bytes(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    raise Denied("unsupported_image_format")
+
+
+def sniff_audio_kind_bytes(data: bytes) -> str:
+    head = data[:4096]
+    if head.startswith(b"OggS"):
+        if b"OpusHead" not in head:
+            raise Denied("unsupported_audio_format")
+        return "ogg-opus"
+    if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return "wav"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "mp4"
+    if _is_webm(head):
+        return "webm"
+    if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0):
+        return "mp3"
+    raise Denied("unsupported_audio_format")
+
+
+def _webp_is_animated(data: bytes) -> bool:
+    if len(data) < 12 or data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        return False
+    cursor = 12
+    while cursor + 8 <= len(data):
+        tag = data[cursor:cursor + 4]
+        size = int.from_bytes(data[cursor + 4:cursor + 8], "little")
+        end = cursor + 8 + size
+        if end > len(data):
+            raise Denied("invalid_media")
+        if tag in {b"ANIM", b"ANMF"}:
+            return True
+        if tag == b"VP8X" and size and data[cursor + 8] & 0x02:
+            return True
+        cursor = end + (size & 1)
+    return False
+
+
+def _document_mime_from_bytes(data: bytes) -> str:
+    head = data[:4096]
+    if head.startswith(b"%PDF-"):
+        return "application/pdf"
+    if head.startswith(b"{\\rtf"):
+        return "application/rtf"
+    if head.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "application/x-ole-storage"
+    if head.startswith((b"PK\x03\x04", b"PK\x05\x06")):
+        return "application/zip"
+    if head.startswith(b"\x1f\x8b"):
+        return "application/gzip"
+    if len(head) >= 262 and head[257:262] == b"ustar":
+        return "application/x-tar"
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if head.startswith(b"OggS"):
+        return "application/ogg"
+    if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+        return "audio/wav"
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "video/mp4"
+    if _is_webm(head):
+        return "video/webm"
+    if head.startswith(b"ID3") or (len(head) >= 2 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0):
+        return "audio/mpeg"
+    try:
+        if b"\x00" in data:
+            return "application/octet-stream"
+        decoder = codecs.getincrementaldecoder("utf-8")("strict")
+        for offset in range(0, len(data), _CHUNK_BYTES):
+            decoder.decode(data[offset:offset + _CHUNK_BYTES])
+        decoder.decode(b"", final=True)
+        if b"\x00" in head:
+            return "application/octet-stream"
+        return "text/plain"
+    except UnicodeError:
+        return "application/octet-stream"
+
+
+def _document_filename_from_bytes(data: bytes, supplied: str | None, mime_type: str) -> str:
+    extension = Path(supplied).suffix.lower() if supplied else ""
+    expected = mimetypes.guess_type("file" + extension, strict=False)[0] if extension else None
+    accepted = {
+        "application/zip": {"application/zip", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                             "application/epub+zip", "application/vnd.oasis.opendocument.text",
+                             "application/vnd.oasis.opendocument.spreadsheet"},
+        "text/plain": {"text/plain", "text/csv", "text/markdown", "application/json", "application/xml",
+                       "text/xml", "text/html", "text/tab-separated-values", "message/rfc822"},
+        "application/x-ole-storage": {"application/x-ole-storage", "application/msword",
+                                       "application/vnd.ms-excel", "application/vnd.ms-powerpoint"},
+        "application/ogg": {"application/ogg", "audio/ogg", "audio/opus"},
+        "audio/wav": {"audio/wav", "audio/x-wav", "audio/wave"},
+        "audio/mpeg": {"audio/mpeg", "audio/mp3", "audio/x-mp3"},
+        "video/mp4": {"video/mp4", "audio/mp4", "audio/x-m4v"},
+    }
+    if (mime_type != "application/octet-stream" and expected and expected != mime_type and
+            expected not in accepted.get(mime_type, set())):
+        raise Denied("media_mime_mismatch")
+    suffix = extension or ".bin"
+    return _safe_outbound_filename(supplied, suffix)
 
 
 @dataclass(frozen=True)

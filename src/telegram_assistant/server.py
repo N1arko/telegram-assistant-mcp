@@ -11,13 +11,32 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
-from typing import Annotated
-from pydantic import Field
+from typing import Annotated, Literal
+from pydantic import BaseModel, ConfigDict, Field
 from mcp.types import CallToolResult, ImageContent, TextContent
 
 StrictID = Annotated[int, Field(strict=True)]
 StrictText = Annotated[str, Field(strict=True)]
 StrictBool = Annotated[bool, Field(strict=True)]
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
+MAX_SMALL_REQUEST_BYTES = 65_536
+MediaBase64 = Annotated[str, Field(strict=True, min_length=1, max_length=27_962_028)]
+MediaFilename = Annotated[str, Field(strict=True, max_length=255)]
+MediaCaption = Annotated[str, Field(strict=True, max_length=2048)]
+StickerEmoji = Annotated[str, Field(strict=True, max_length=8)]
+
+
+class OutboundMediaInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    media_type: Literal["photo", "video", "document", "audio", "voice", "animation", "sticker"]
+    data_base64: MediaBase64
+    filename: MediaFilename | None = None
+    caption: MediaCaption | None = None
+    sticker_emoji: StickerEmoji | None = None
+
+
+MediaItems = Annotated[list[OutboundMediaInput], Field(min_length=1, max_length=10)]
 
 # The only permitted broadcast-channel read exception is populated with the
 # session-verified (marked peer ID, username) pair. None keeps v1 behavior.
@@ -40,6 +59,7 @@ class RequestLimits:
     def __init__(self, app, *, validate_rpc_ids=True):
         self.app = app
         self.validate_rpc_ids = validate_rpc_ids
+        self.body_slots = asyncio.Semaphore(1)
 
     @staticmethod
     async def reject(send, status):
@@ -48,21 +68,37 @@ class RequestLimits:
         await send({"type": "http.response.body", "body": b'{"error":"request_rejected"}'})
 
     async def __call__(self, scope, receive, send):
+        if (self.validate_rpc_ids and scope.get("type") == "http" and
+                scope.get("path") == "/mcp" and scope.get("method") == "POST"):
+            # MCP media arguments are inline base64 JSON. At most one request
+            # body is buffered/decoded at once on this 512 MiB service.
+            async with self.body_slots:
+                return await self._handle(scope, receive, send)
+        return await self._handle(scope, receive, send)
+
+    async def _handle(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         headers = scope.get("headers", [])
         if len(headers) > 128 or sum(len(k) + len(v) for k, v in headers) > 16384:
             return await self.reject(send, 431)
         chunks, size = [], 0
+        upload_endpoint = (self.validate_rpc_ids and scope.get("path") == "/mcp" and
+                           scope.get("method") == "POST")
+        max_request = MAX_REQUEST_BYTES if upload_endpoint else MAX_SMALL_REQUEST_BYTES
+        body_deadline = asyncio.get_running_loop().time() + 60
         while True:
             try:
-                part = await asyncio.wait_for(receive(), timeout=5)
+                remaining = body_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise TimeoutError
+                part = await asyncio.wait_for(receive(), timeout=min(5, remaining))
             except TimeoutError:
                 return await self.reject(send, 408)
             if part["type"] == "http.disconnect":
                 return
             size += len(part.get("body", b""))
-            if size > 65536:
+            if size > max_request:
                 return await self.reject(send, 413)
             chunks.append(part)
             if not part.get("more_body", False):
@@ -77,11 +113,16 @@ class RequestLimits:
                              or (type(rpc_id) is str and len(rpc_id.encode("utf-8")) <= 128))
                     if not valid:
                         return await self.reject(send, 400)
+                params = obj.get("params") if isinstance(obj, dict) else None
+                media_call = (isinstance(obj, dict) and obj.get("method") == "tools/call" and
+                              isinstance(params, dict) and params.get("name") == "send_media")
+                if size > MAX_SMALL_REQUEST_BYTES and not media_call:
+                    return await self.reject(send, 413)
                 if (isinstance(obj, dict) and obj.get("method") == "tools/call" and
-                        isinstance(obj.get("params"), dict) and obj["params"].get("name") == "view_photo"):
+                        isinstance(params, dict) and params.get("name") == "view_photo"):
                     response_limit = MAX_MEDIA_RESPONSE_BYTES
             except (ValueError, UnicodeError):
-                return await self.reject(send, 400)
+                return await self.reject(send, 413 if size > MAX_SMALL_REQUEST_BYTES else 400)
         async def replay():
             if chunks:
                 return chunks.pop(0)
@@ -229,6 +270,23 @@ def build_mcp(service, config, verifier, *, read_only=False):
         """
         return await call("send_message", peer_id=peer_id, text=text, reply_to=reply_to,
                           first_contact_message_id=first_contact_message_id)
+
+    @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False,
+        openWorldHint=True), meta={"securitySchemes": [{"type": "oauth2", "scopes": ["telegram:read", "telegram:send"]}]})
+    async def send_media(peer_id: StrictID, items: MediaItems,
+                         reply_to: StrictID | None = None) -> CallToolResult:
+        """Send one JPEG/PNG photo, MP4/WebM video, document, supported audio file, OGG/Opus voice note,
+        GIF animation or static WebP sticker.
+        Each item supplies media_type and data_base64; document items also accept a filename, all except stickers
+        accept an optional caption up to 1,024 UTF-16 units. Two to ten photos/videos may be sent as one album.
+        Raw binary totals at most 20 MiB, photos 8 MiB/12 MP, video/GIF frames 12 MP, stickers 512 KiB/512 px;
+        audio/voice and video/GIF durations are capped at five minutes. The whole operation is capped at 120 sec.
+        The data is only sent to this Telegram recipient. Requires the same
+        send scope and recipient grants/quotas as send_message. Use only with current user permission; the exact
+        owner channel, broadcast channels, bots and first-contact-only grants cannot receive media. A failed or
+        timed-out operation has unknown delivery and must never be retried automatically.
+        """
+        return await call("send_media", peer_id=peer_id, items=items, reply_to=reply_to)
 
     return mcp
 

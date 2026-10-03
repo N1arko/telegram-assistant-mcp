@@ -14,10 +14,12 @@ from .security import Denied, Policy, Quotas, RateGate, integer, peer_id as vali
 from .media import (ImageResult, MAX_AUDIO_INPUT_BYTES, MAX_IMAGE_PREVIEW_BYTES,
                     MAX_IMAGE_INPUT_BYTES, MAX_MEDIA_RESPONSE_BYTES, MEDIA_TIMEOUT_SECONDS, MediaCache,
                     MAX_TRANSCRIPT_CHARS, TranscriptionConfig, prepare_audio, preview_image,
-                    sniff_audio_kind, temporary_media_dir)
+                    sniff_audio_kind, temporary_media_dir, prepare_outbound_media,
+                    MAX_OUTBOUND_ITEMS, MAX_OUTBOUND_MEDIA_BYTES)
 
 SCOPES: ContextVar[frozenset[str]] = ContextVar("telegram_assistant_scopes", default=frozenset())
 MAX_BYTES = 48 * 1024
+MEDIA_SEND_TIMEOUT_SECONDS = 120
 
 
 def clip(value, limit=200):
@@ -68,12 +70,13 @@ class Service:
         if "telegram:read" not in SCOPES.get():
             return {"error": "unauthorized"}
         if operation not in {"list_dialogs", "get_history", "search_messages", "get_reply_context",
-                             "view_photo", "transcribe_audio", "send_message"}:
+                             "view_photo", "transcribe_audio", "send_message", "send_media"}:
             return {"error": "unknown_tool"}
         async with self.lock:
             try:
                 self.gate.check()
-                timeout = MEDIA_TIMEOUT_SECONDS if operation in {"view_photo", "transcribe_audio"} else 20
+                timeout = (MEDIA_SEND_TIMEOUT_SECONDS if operation == "send_media" else
+                           MEDIA_TIMEOUT_SECONDS if operation in {"view_photo", "transcribe_audio"} else 20)
                 result = await asyncio.wait_for(getattr(self, operation)(*args, **kwargs), timeout)
                 if isinstance(result, ImageResult):
                     if (not isinstance(result.data, bytes) or result.mime_type != "image/jpeg" or
@@ -88,7 +91,7 @@ class Service:
                     result["retry_after_seconds"] = exc.retry_after
                 return result
             except TimeoutError:
-                return {"error": "delivery_unknown" if operation == "send_message" else
+                return {"error": "delivery_unknown" if operation in {"send_message", "send_media"} else
                         ("media_timeout" if operation in {"view_photo", "transcribe_audio"} else "telegram_timeout")}
             except Exception as exc:
                 # Inspect structured flood fields only; never return/log repr or args.
@@ -96,7 +99,7 @@ class Service:
                     seconds = max(1, int(getattr(exc, "seconds", 60)))
                     self.gate.flood(seconds)
                     return {"error": "telegram_rate_limited", "retry_after_seconds": seconds}
-                return {"error": "delivery_unknown" if operation == "send_message" else
+                return {"error": "delivery_unknown" if operation in {"send_message", "send_media"} else
                         ("media_unavailable" if operation in {"view_photo", "transcribe_audio"} else "telegram_unavailable")}
 
     async def view_photo(self, peer_id, message_id):
@@ -390,3 +393,68 @@ class Service:
         if grant.first_contact and first_contact_message_id is not None:
             self.quotas.finish_first_contact(target, first_contact_message_id, "sent")
         return {"sent": True, "peer_id": target, "message_id": result}
+
+    async def send_media(self, peer_id, items, reply_to=None):
+        target = validate_peer_id(peer_id)
+        if reply_to is not None:
+            integer(reply_to, 1, 2**31 - 1)
+        if not isinstance(items, list) or not 1 <= len(items) <= MAX_OUTBOUND_ITEMS:
+            raise Denied("invalid_media_count")
+        normalized = []
+        for item in items:
+            if hasattr(item, "model_dump"):
+                item = item.model_dump()
+            if not isinstance(item, dict):
+                raise Denied("invalid_media")
+            normalized.append(item)
+        kinds = [item.get("media_type") for item in normalized]
+        if len(items) > 1 and any(kind not in {"photo", "video"} for kind in kinds):
+            raise Denied("invalid_media_album")
+        captions = [item.get("caption") for item in normalized]
+        candidates = self.policy.precheck_media(target, captions, SCOPES.get(), self.clock())
+        if self.quotas is None:
+            raise Denied("send_denied")
+
+        total_bytes = 0
+        with temporary_media_dir() as directory:
+            files = []
+            for index, item in enumerate(normalized):
+                item_directory = Path(directory) / str(index)
+                item_directory.mkdir(mode=0o700)
+                prepared = await prepare_outbound_media(
+                    item, item_directory, remaining_bytes=MAX_OUTBOUND_MEDIA_BYTES - total_bytes)
+                total_bytes += prepared.path.stat().st_size
+                if total_bytes > MAX_OUTBOUND_MEDIA_BYTES:
+                    raise Denied("media_too_large")
+                files.append(prepared)
+
+            target, peer_type = await self._resolve(target, return_type=True)
+            needs_human = peer_type == "user" or any(
+                grant.selector in {"all_human_dms", "first_contact"} for grant in candidates)
+            is_human = False
+            if needs_human:
+                check_human = getattr(self.backend, "is_human_user", None)
+                is_human = bool(check_human and await check_human(target))
+                if not is_human:
+                    raise Denied("peer_not_human")
+            grant = self.policy.authorize_media(target, captions, SCOPES.get(), self.clock(),
+                                                peer_type=peer_type, is_human=is_human)
+            if reply_to is not None and await self.backend.message(target, reply_to) is None:
+                raise Denied("reply_target_missing")
+            send = getattr(self.backend, "send_media_files", None)
+            if send is None:
+                raise Denied("media_send_unavailable")
+            try:
+                self.quotas.reserve(grant, self.clock(), count=len(files))
+            except Denied:
+                raise
+            except Exception:
+                raise Denied("send_quota_unavailable") from None
+            try:
+                message_ids = await send(target, files, reply_to)
+            except BaseException:
+                # Telegram may have accepted all or part of an album before a
+                # transport failure. Never retry an uncertain media send.
+                raise
+        return {"sent": True, "peer_id": target, "message_ids": message_ids,
+                "media_count": len(files), "album": len(files) > 1}
