@@ -164,15 +164,16 @@ class Service:
             if duration > self.transcription.max_duration_seconds:
                 raise Denied("audio_too_long")
             billable_seconds = max(1, math.ceil(duration))
-            if self.quotas is None:
-                raise Denied("transcription_budget_unavailable")
-            try:
-                self.quotas.reserve_transcription(
-                    billable_seconds, self.transcription.monthly_seconds, self.clock())
-            except Denied:
-                raise
-            except Exception:
-                raise Denied("transcription_budget_unavailable") from None
+            if self.transcription.monthly_seconds:
+                if self.quotas is None:
+                    raise Denied("transcription_budget_unavailable")
+                try:
+                    self.quotas.reserve_transcription(
+                        billable_seconds, self.transcription.monthly_seconds, self.clock())
+                except Denied:
+                    raise
+                except Exception:
+                    raise Denied("transcription_budget_unavailable") from None
             try:
                 transcript = await self.transcriber.transcribe(
                     upload, filename=filename, mime_type=mime_type)

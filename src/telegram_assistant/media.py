@@ -54,8 +54,7 @@ class TranscriptionConfig:
             raise Denied("invalid_transcription_config")
         if self.provider == "openai":
             if (not isinstance(self.key, str) or not 20 <= len(self.key) <= 4096 or
-                    not all(0x21 <= ord(char) <= 0x7E for char in self.key) or
-                    not self.monthly_seconds):
+                    not all(0x21 <= ord(char) <= 0x7E for char in self.key)):
                 raise Denied("invalid_transcription_config")
         elif self.key is not None:
             raise Denied("invalid_transcription_config")

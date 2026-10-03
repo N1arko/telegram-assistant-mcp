@@ -293,6 +293,19 @@ class MediaServiceBudgetTests(unittest.IsolatedAsyncioTestCase):
         SCOPES.reset(self.scope)
         self.tmp.cleanup()
 
+    async def test_zero_local_monthly_cap_uses_provider_without_quota_database(self):
+        source = Path(self.tmp.name) / "source.wav"
+        make_wav(source)
+        backend = MediaBackend(source.read_bytes(), {"declared_duration": 1, "declared_mime": "audio/wav"})
+        transcriber = FakeTranscriber("provider-budgeted synthetic transcript")
+        service = Service(backend, gate=RateGate(limit=100),
+                          transcription=TranscriptionConfig(
+                              "openai", "sk-unit-test-key-123456789", monthly_seconds=0),
+                          transcriber=transcriber)
+        result = await service.invoke("transcribe_audio", peer_id=42, message_id=9)
+        self.assertEqual(result["transcript"], "provider-budgeted synthetic transcript")
+        self.assertEqual(len(transcriber.calls), 1)
+
     async def test_budget_is_reserved_before_call_and_never_refunds_failure(self):
         source = Path(self.tmp.name) / "source.wav"
         make_wav(source)

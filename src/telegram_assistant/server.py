@@ -470,7 +470,7 @@ def main():
     parser.add_argument("--transcription-key-file", type=Path,
                         help="Private owner-only file with OPENAI_API_KEY; used only when provider=openai")
     parser.add_argument("--transcription-monthly-seconds", type=int, default=0,
-                        help="Persistent monthly audio budget in seconds")
+                        help="Optional persistent monthly audio cap in seconds (0 disables the local cap)")
     parser.add_argument("--transcription-max-duration-seconds", type=int, default=MAX_AUDIO_SECONDS,
                         help="Per-file duration cap, from 1 through 300 seconds")
     args = parser.parse_args()
@@ -488,8 +488,6 @@ def main():
             parser.error("--transcription-monthly-seconds must be in 0..2678400")
         if args.transcription_provider == "openai" and args.transcription_key_file is None:
             parser.error("--transcription-provider openai requires --transcription-key-file")
-        if args.transcription_provider == "openai" and args.transcription_monthly_seconds == 0:
-            parser.error("--transcription-provider openai requires a positive monthly audio budget")
     try:
         asyncio.run(serve_bootstrap(args) if args.mode == "bootstrap" else serve(args))
     except KeyboardInterrupt:
