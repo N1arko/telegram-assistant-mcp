@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -12,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 from typing import Annotated
 from pydantic import Field
-from mcp.types import CallToolResult, TextContent
+from mcp.types import CallToolResult, ImageContent, TextContent
 
 StrictID = Annotated[int, Field(strict=True)]
 StrictText = Annotated[str, Field(strict=True)]
@@ -25,6 +26,7 @@ READ_ONLY_BROADCAST_CHANNEL = None
 from .auth import AuthConfig, JWKSVerifier, https_url
 from .security import Denied, private_file
 from .service import MAX_BYTES
+from .media import ImageResult, MAX_MEDIA_RESPONSE_BYTES, MAX_AUDIO_SECONDS, OpenAITranscriber, TranscriptionConfig
 
 
 def silence_logs():
@@ -65,6 +67,7 @@ class RequestLimits:
             chunks.append(part)
             if not part.get("more_body", False):
                 break
+        response_limit = MAX_BYTES
         if self.validate_rpc_ids and scope.get("path") == "/mcp" and scope.get("method") == "POST":
             try:
                 obj = json.loads(b"".join(part.get("body", b"") for part in chunks))
@@ -74,6 +77,9 @@ class RequestLimits:
                              or (type(rpc_id) is str and len(rpc_id.encode("utf-8")) <= 128))
                     if not valid:
                         return await self.reject(send, 400)
+                if (isinstance(obj, dict) and obj.get("method") == "tools/call" and
+                        isinstance(obj.get("params"), dict) and obj["params"].get("name") == "view_photo"):
+                    response_limit = MAX_MEDIA_RESPONSE_BYTES
             except (ValueError, UnicodeError):
                 return await self.reject(send, 400)
         async def replay():
@@ -92,7 +98,7 @@ class RequestLimits:
                 return
             if not oversized:
                 response_body.extend(event.get("body", b""))
-                if len(response_body) > MAX_BYTES:
+                if len(response_body) > response_limit:
                     oversized = True
                     response_body.clear()
             if event.get("more_body", False):
@@ -166,6 +172,10 @@ def build_mcp(service, config, verifier, *, read_only=False):
         context = SCOPES.set(frozenset(token.scopes) if token else frozenset())
         try:
             payload = await service.invoke(name, **kwargs)
+            if isinstance(payload, ImageResult):
+                return CallToolResult(content=[ImageContent(
+                    type="image", data=base64.b64encode(payload.data).decode("ascii"),
+                    mimeType=payload.mime_type)])
             return CallToolResult(content=[TextContent(type="text", text=json.dumps(
                 payload, ensure_ascii=False, separators=(",", ":")))], isError=bool(payload.get("error")))
         finally:
@@ -193,6 +203,16 @@ def build_mcp(service, config, verifier, *, read_only=False):
     async def get_reply_context(peer_id: StrictID, message_id: StrictID, radius: StrictID = 3) -> CallToolResult:
         """Read target, nearby messages and direct quote. Cross-peer quote exposes references only."""
         return await call("get_reply_context", peer_id=peer_id, message_id=message_id, radius=radius)
+
+    @mcp.tool(annotations=read, meta=schemes)
+    async def view_photo(peer_id: StrictID, message_id: StrictID) -> CallToolResult:
+        """Fetch and render one photo attachment from this exact message. This explicit call returns a native MCP image; history never downloads media."""
+        return await call("view_photo", peer_id=peer_id, message_id=message_id)
+
+    @mcp.tool(annotations=read, meta=schemes)
+    async def transcribe_audio(peer_id: StrictID, message_id: StrictID) -> CallToolResult:
+        """Transcribe one voice/audio attachment from this exact message. If enabled, audio is sent to OpenAI; disabled by default. History never downloads media."""
+        return await call("transcribe_audio", peer_id=peer_id, message_id=message_id)
 
     if read_only:
         return mcp
@@ -367,7 +387,26 @@ async def serve(args):
                             flood_sleep_threshold=0, request_retries=0, raise_last_call_error=True,
                             connection_retries=1, device_model="Telegram Assistant MCP", app_version="0.1.0")
     verifier = JWKSVerifier(auth)
+    transcriber = None
     try:
+        transcription_provider = getattr(args, "transcription_provider", "off")
+        transcription_key_file = getattr(args, "transcription_key_file", None)
+        transcription_monthly_seconds = getattr(args, "transcription_monthly_seconds", 0)
+        transcription_max_duration = getattr(args, "transcription_max_duration_seconds", MAX_AUDIO_SECONDS)
+        transcription_key = None
+        if transcription_provider == "openai":
+            if transcription_key_file is None:
+                raise Denied("invalid_transcription_config")
+            try:
+                transcription_key = private_file(transcription_key_file, max_bytes=4096).decode("ascii").strip()
+            except (UnicodeError, OSError):
+                raise Denied("invalid_transcription_config") from None
+        transcription = TranscriptionConfig(
+            provider=transcription_provider, key=transcription_key,
+            monthly_seconds=transcription_monthly_seconds,
+            max_duration_seconds=transcription_max_duration)
+        if transcription.provider == "openai":
+            transcriber = OpenAITranscriber(transcription.key)
         activation_lock = asyncio.Lock()
         ready = False
 
@@ -395,7 +434,8 @@ async def serve(args):
                             read_only_broadcast_channel=READ_ONLY_BROADCAST_CHANNEL),
             Policy.load(args.policy), quotas,
             gate=RateGate(storage=quotas, startup_grace=60),
-            read_only_broadcast_channel=READ_ONLY_BROADCAST_CHANNEL)
+            read_only_broadcast_channel=READ_ONLY_BROADCAST_CHANNEL,
+            transcription=transcription, transcriber=transcriber)
         read_only = getattr(args, "read_only", False)
         mcp = build_mcp(service, auth, verifier, read_only=read_only)
         app = build_app(mcp, auth, read_only=read_only)
@@ -405,6 +445,8 @@ async def serve(args):
         await server.serve()
     finally:
         await client.disconnect()
+        if transcriber is not None:
+            await transcriber.close()
         lock.release()
         quotas.close()
         await verifier.close()
@@ -417,21 +459,37 @@ def main():
     parser.add_argument("--mode", choices=("live", "bootstrap"), default="live",
                         help="bootstrap serves public OAuth metadata and rejects every MCP request")
     parser.add_argument("--container-network", action="store_true", help="Bind inside isolated Docker network; never publish backend ports")
-    parser.add_argument("--read-only", action="store_true", help="Expose only four reads and advertise only telegram:read")
+    parser.add_argument("--read-only", action="store_true", help="Expose read tools only and advertise only telegram:read")
     parser.add_argument("--bootstrap-config", type=Path)
     parser.add_argument("--auth-config", type=Path)
     parser.add_argument("--telegram-config", type=Path)
     parser.add_argument("--policy", type=Path)
     parser.add_argument("--runtime-dir", type=Path)
+    parser.add_argument("--transcription-provider", choices=("off", "openai"), default="off",
+                        help="External audio transcription provider (off by default)")
+    parser.add_argument("--transcription-key-file", type=Path,
+                        help="Private owner-only file with OPENAI_API_KEY; used only when provider=openai")
+    parser.add_argument("--transcription-monthly-seconds", type=int, default=0,
+                        help="Persistent monthly audio budget in seconds")
+    parser.add_argument("--transcription-max-duration-seconds", type=int, default=MAX_AUDIO_SECONDS,
+                        help="Per-file duration cap, from 1 through 300 seconds")
     args = parser.parse_args()
     if args.mode == "bootstrap":
         if args.read_only or args.bootstrap_config is None or any((args.auth_config, args.telegram_config,
-                                                 args.policy, args.runtime_dir)):
+                                                 args.policy, args.runtime_dir)) or args.transcription_provider != "off" or args.transcription_key_file:
             parser.error("bootstrap requires --bootstrap-config and forbids live configuration arguments")
     else:
         if args.bootstrap_config is not None or any(x is None for x in
                 (args.auth_config, args.telegram_config, args.policy, args.runtime_dir)):
             parser.error("live mode requires --auth-config, --telegram-config, --policy and --runtime-dir")
+        if args.transcription_max_duration_seconds < 1 or args.transcription_max_duration_seconds > MAX_AUDIO_SECONDS:
+            parser.error("--transcription-max-duration-seconds must be in 1..300")
+        if args.transcription_monthly_seconds < 0 or args.transcription_monthly_seconds > 31 * 24 * 3600:
+            parser.error("--transcription-monthly-seconds must be in 0..2678400")
+        if args.transcription_provider == "openai" and args.transcription_key_file is None:
+            parser.error("--transcription-provider openai requires --transcription-key-file")
+        if args.transcription_provider == "openai" and args.transcription_monthly_seconds == 0:
+            parser.error("--transcription-provider openai requires a positive monthly audio budget")
     try:
         asyncio.run(serve_bootstrap(args) if args.mode == "bootstrap" else serve(args))
     except KeyboardInterrupt:

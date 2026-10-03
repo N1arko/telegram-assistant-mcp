@@ -281,6 +281,7 @@ class Quotas:
         self.db.execute("CREATE INDEX IF NOT EXISTS attempts_time_lookup ON attempts(at)")
         self.db.execute("CREATE TABLE IF NOT EXISTS first_contact_attempts (peer INTEGER, message_id INTEGER, at REAL, state TEXT, PRIMARY KEY(peer,message_id))")
         self.db.execute("CREATE TABLE IF NOT EXISTS read_gate (id INTEGER PRIMARY KEY CHECK(id=1), state TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS transcription_usage (month TEXT PRIMARY KEY, seconds INTEGER NOT NULL)")
         self.db.commit()
 
     def load_gate(self):
@@ -330,6 +331,27 @@ class Quotas:
         self.db.execute("UPDATE first_contact_attempts SET state=? WHERE peer=? AND message_id=?",
                         (state, peer, message_id))
         self.db.commit()
+
+    def reserve_transcription(self, seconds: int, monthly_limit: int, now: float):
+        """Reserve billable audio seconds transactionally before a provider call."""
+        if (type(seconds) is not int or seconds < 1 or type(monthly_limit) is not int or
+                monthly_limit < 1 or type(now) not in (int, float) or not math.isfinite(now)):
+            raise Denied("transcription_budget_unavailable")
+        month = time.strftime("%Y-%m", time.gmtime(now))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.db.execute("SELECT seconds FROM transcription_usage WHERE month=?", (month,)).fetchone()
+            used = row[0] if row is not None else 0
+            if type(used) is not int or used < 0:
+                raise Denied("transcription_budget_unavailable")
+            if used + seconds > monthly_limit:
+                raise Denied("transcription_budget_exceeded")
+            self.db.execute("INSERT OR REPLACE INTO transcription_usage VALUES(?, ?)",
+                            (month, used + seconds))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
 
     def close(self):
         self.db.close()

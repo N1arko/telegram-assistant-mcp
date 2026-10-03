@@ -9,7 +9,8 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 import httpx
 from telegram_assistant.auth import AuthConfig, JWKSVerifier, validate_claims
 from telegram_assistant.server import RequestLimits, build_app, build_mcp
-from telegram_assistant.service import Service
+from telegram_assistant.service import MAX_BYTES, SCOPES, Service
+from telegram_assistant.media import ImageResult, MAX_MEDIA_RESPONSE_BYTES
 from test_service import Fake
 
 
@@ -127,7 +128,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             self.jwks_calls+=1
             return httpx.Response(200,json={"keys":[jwk()]})
         self.verifier=JWKSVerifier(CONFIG,http=httpx.AsyncClient(transport=httpx.MockTransport(fetch_keys)))
-        self.mcp=build_mcp(Service(self.fake),CONFIG,self.verifier,read_only=getattr(self,"read_only",False))
+        self.service=Service(self.fake)
+        self.mcp=build_mcp(self.service,CONFIG,self.verifier,read_only=getattr(self,"read_only",False))
         self.app=build_app(self.mcp,CONFIG,read_only=getattr(self,"read_only",False))
         self.ready = asyncio.Event()
         self.stop = asyncio.Event()
@@ -176,12 +178,40 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         response=await self.rpc("tools/list")
         self.assertEqual(response.status_code,200,response.text)
         names={t["name"] for t in response.json()["result"]["tools"]}
-        self.assertEqual(names,{"list_dialogs","get_history","search_messages","get_reply_context","send_message"})
+        self.assertEqual(names,{"list_dialogs","get_history","search_messages","get_reply_context",
+                               "view_photo","transcribe_audio","send_message"})
         for name in ["set_policy","edit_message","delete_message","mark_as_read","download_media","transcribe_voice"]:
             result=await self.rpc("tools/call",{"name":name,"arguments":{}})
             self.assertTrue(result.json()["result"]["isError"])
         self.assertEqual(await self.mcp.list_resources(),[])
         self.assertEqual(await self.mcp.list_prompts(),[])
+    async def test_photo_returns_native_image_with_separate_bounded_envelope(self):
+        preview=b"\xff\xd8\xff" + b"p" * (200 * 1024 - 3)
+        self.service.view_photo=AsyncMock(return_value=ImageResult(preview))
+        response=await self.rpc("tools/call",{"name":"view_photo",
+            "arguments":{"peer_id":42,"message_id":9}})
+        self.assertEqual(response.status_code,200,response.text[:200])
+        self.assertGreater(len(response.content),MAX_BYTES)
+        self.assertLessEqual(len(response.content),MAX_MEDIA_RESPONSE_BYTES)
+        item=response.json()["result"]["content"][0]
+        self.assertEqual(item["type"],"image")
+        self.assertEqual(item["mimeType"],"image/jpeg")
+        import base64
+        self.assertEqual(base64.b64decode(item["data"]),preview)
+
+    async def test_non_photo_tool_keeps_the_48k_asgi_response_cap(self):
+        body=b'{"oversized":"' + b"x" * (MAX_BYTES + 1024) + b'"}'
+        sent=[]
+        async def app(scope, receive, send):
+            await send({"type":"http.response.start","status":200,"headers":[]})
+            await send({"type":"http.response.body","body":body})
+        async def receive():
+            return {"type":"http.request","body":b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_history"}}',"more_body":False}
+        async def send(event):
+            sent.append(event)
+        await RequestLimits(app)({"type":"http","path":"/mcp","method":"POST","headers":[]},receive,send)
+        self.assertEqual(sent[0]["status"],503)
+        self.assertEqual(sent[-1]["body"],b'{"error":"request_rejected"}')
     async def test_history_over_actual_sdk_no_ports(self):
         response=await self.rpc("tools/call",{"name":"get_history","arguments":{"peer_id":42,"limit":3}})
         self.assertEqual(response.status_code,200,response.text)

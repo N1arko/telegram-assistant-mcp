@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import time
+import os
 from collections import OrderedDict
 from dataclasses import dataclass
 from .security import Denied
@@ -252,6 +253,89 @@ class TelethonBackend:
         await self.activate()
         message = await self.client.get_messages(self.peers[target], ids=message_id)
         return self.record(message) if message else None
+
+    async def fetch_media_file(self, target, message_id, *, kind, destination, max_bytes):
+        """Fetch only one explicitly requested photo/audio attachment to a bounded file."""
+        from math import ceil
+        from telethon import types
+        from .media import MAX_IMAGE_PIXELS
+
+        await self.activate()
+        message = await self.client.get_messages(self.peers[target], ids=message_id)
+        if message is None or getattr(message, "id", None) != message_id:
+            raise Denied("message_missing")
+
+        declared_mime = None
+        declared_duration = None
+        if kind == "photo" and getattr(message, "photo", None) is not None:
+            photo = message.photo
+            candidates = []
+            for size in getattr(photo, "sizes", ()) or ():
+                width, height = getattr(size, "w", None), getattr(size, "h", None)
+                progressive = getattr(size, "sizes", None)
+                file_size = (progressive[-1] if isinstance(progressive, (list, tuple)) and progressive
+                             else getattr(size, "size", None))
+                if (type(width) is int and type(height) is int and width > 0 and height > 0 and
+                        type(file_size) is int and file_size > 0):
+                    candidates.append((width * height, size, file_size))
+            if not candidates:
+                raise Denied("unsupported_image_format")
+            eligible = [row for row in candidates
+                        if row[0] <= MAX_IMAGE_PIXELS and row[2] <= max_bytes]
+            if not eligible:
+                if any(row[0] > MAX_IMAGE_PIXELS for row in candidates):
+                    raise Denied("image_too_many_pixels")
+                raise Denied("image_too_large")
+            _, chosen, declared_size = max(eligible, key=lambda row: row[0])
+            location = types.InputPhotoFileLocation(
+                id=photo.id, access_hash=photo.access_hash,
+                file_reference=photo.file_reference, thumb_size=chosen.type)
+            metadata = {"kind": "photo", "size": declared_size,
+                        "declared_mime": None, "declared_duration": None}
+        elif kind == "audio" and getattr(message, "document", None) is not None:
+            document = message.document
+            audio_attribute = next((attribute for attribute in getattr(document, "attributes", ())
+                                    if isinstance(attribute, types.DocumentAttributeAudio)), None)
+            if audio_attribute is None:
+                raise Denied("unsupported_audio_format")
+            declared_size = getattr(document, "size", None)
+            if type(declared_size) is not int or declared_size <= 0:
+                raise Denied("audio_too_large")
+            if declared_size > max_bytes:
+                raise Denied("audio_too_large")
+            declared_mime = getattr(document, "mime_type", None)
+            declared_duration = getattr(audio_attribute, "duration", None)
+            location = document
+            metadata = {"kind": "audio", "size": declared_size,
+                        "declared_mime": declared_mime, "declared_duration": declared_duration,
+                        "voice": bool(getattr(audio_attribute, "voice", False))}
+        else:
+            raise Denied("media_type_unsupported")
+
+        declared_size = metadata["size"]
+        total = 0
+        try:
+            with open(destination, "xb") as output:
+                os.fchmod(output.fileno(), 0o600)
+                iterator = self.client.iter_download(
+                    location, request_size=64 * 1024, chunk_size=64 * 1024,
+                    limit=ceil(declared_size / (64 * 1024)), file_size=declared_size)
+                async for chunk in iterator:
+                    if not isinstance(chunk, (bytes, bytearray, memoryview)):
+                        raise Denied("media_download_failed")
+                    total += len(chunk)
+                    if total > max_bytes or total > declared_size:
+                        raise Denied("media_size_mismatch")
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+        except Denied:
+            raise
+        except Exception:
+            raise Denied("media_download_failed") from None
+        if total != declared_size:
+            raise Denied("media_size_mismatch")
+        return metadata
 
     async def around(self, target, message_id, radius):
         await self.activate()

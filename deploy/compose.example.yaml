@@ -36,6 +36,6 @@ services:
         source: ../private/state
         target: /state
     tmpfs:
-      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+      - /tmp:rw,noexec,nosuid,size=64m,mode=1777
     logging:
       driver: none

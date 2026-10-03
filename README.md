@@ -6,7 +6,9 @@ A small MCP server for searching a Telegram user's personal chats and groups. It
 
 ## What it can do
 
-In `--read-only` mode, four bounded, paginated tools are available: `list_dialogs`, `get_history`, `search_messages`, and `get_reply_context`. The code also contains a separate permission-gated `send_message` path that is unavailable in read-only mode. It is outside this setup, and live Telegram sending has not been verified. Do not enable it for this use. Broadcast channels are filtered by default, so this is not universal access to every Telegram chat or channel.
+In `--read-only` mode, six bounded tools are available: `list_dialogs`, `get_history`, `search_messages`, `get_reply_context`, `view_photo`, and `transcribe_audio`. History only lists media presence; it never downloads attachments. `view_photo` fetches a photo only when called for an exact message and returns a native MCP image preview. `transcribe_audio` is disabled by default. When explicitly enabled, it sends only the selected voice/audio file to OpenAI for transcription and applies per-file and monthly audio limits. See the [media setup](docs/GETTING-STARTED.en.md#explicit-media-tools) before enabling it.
+
+The code also contains a separate permission-gated `send_message` path that is unavailable in read-only mode. It is outside this setup, and live Telegram sending has not been verified. Do not enable it for this use. Broadcast channels are filtered by default, so this is not universal access to every Telegram chat or channel.
 
 ## What you'll need
 
@@ -26,7 +28,7 @@ Keep read-only mode enabled. Never share or commit secrets or Telegram session f
 
 ## Development
 
-Use Python 3.11 or newer. The test suite uses mocked Telegram clients, HTTP MockTransport, and in-process ASGI; it does not log in to Telegram or open a listening socket. The full suite, including fake-login PTY tests, was verified with Python 3.14.6 and all 182 tests passed. PTY tests require a normal controlling terminal. The lock includes the optional QR renderer used by the tests; Docker templates require validation on the target Linux host.
+Use Python 3.11 or newer. The test suite uses mocked Telegram clients, HTTP MockTransport, in-process ASGI, and synthetic audio/image files; it does not log in to Telegram or send audio to a provider. The full suite also contains PTY tests that require a normal controlling terminal. The lock includes the optional QR renderer used by the tests. Photo preview and OGG/Opus remux require `ffmpeg` and `ffprobe`; the Docker image installs them. Docker templates require validation on the target Linux host.
 
     python3 -m venv .venv
     .venv/bin/python -m pip install -r requirements.lock

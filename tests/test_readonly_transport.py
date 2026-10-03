@@ -18,7 +18,7 @@ class ReadOnlyTransportTests(unittest.IsolatedAsyncioTestCase):
         response = await self.rpc('tools/list')
         tools = response.json()['result']['tools']
         self.assertEqual({t['name'] for t in tools},
-            {'list_dialogs','get_history','search_messages','get_reply_context'})
+            {'list_dialogs','get_history','search_messages','get_reply_context','view_photo','transcribe_audio'})
         self.assertTrue(all(t['annotations']['readOnlyHint'] for t in tools))
 
     async def test_send_absent_even_for_valid_owner_with_write_scope(self):

@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import secrets
 import time
 from collections import OrderedDict
 from contextvars import ContextVar
+from pathlib import Path
 
 from .security import Denied, Policy, Quotas, RateGate, integer, peer_id as validate_peer_id
+from .media import (ImageResult, MAX_AUDIO_INPUT_BYTES, MAX_IMAGE_PREVIEW_BYTES,
+                    MAX_IMAGE_INPUT_BYTES, MAX_MEDIA_RESPONSE_BYTES, MEDIA_TIMEOUT_SECONDS, MediaCache,
+                    MAX_TRANSCRIPT_CHARS, TranscriptionConfig, prepare_audio, preview_image,
+                    sniff_audio_kind, temporary_media_dir)
 
 SCOPES: ContextVar[frozenset[str]] = ContextVar("telegram_assistant_scopes", default=frozenset())
 MAX_BYTES = 48 * 1024
@@ -41,13 +47,18 @@ def bounded(payload):
 
 class Service:
     def __init__(self, backend, policy: Policy | None = None, quotas: Quotas | None = None,
-                 *, gate=None, clock=time.time, read_only_broadcast_channel=None):
+                 *, gate=None, clock=time.time, read_only_broadcast_channel=None,
+                 transcription: TranscriptionConfig | None = None, transcriber=None,
+                 media_cache=None):
         self.backend = backend
         self.policy = policy or Policy()
         self.quotas = quotas
         self.gate = gate or RateGate()
         self.clock = clock
         self.read_only_broadcast_channel = read_only_broadcast_channel
+        self.transcription = transcription or TranscriptionConfig()
+        self.transcriber = transcriber
+        self.media_cache = media_cache or MediaCache()
         self.lock = asyncio.Lock()
         self.snapshots = OrderedDict()
         self.cursors = OrderedDict()
@@ -56,26 +67,127 @@ class Service:
         # Tool annotations are hints, not authorization.
         if "telegram:read" not in SCOPES.get():
             return {"error": "unauthorized"}
-        if operation not in {"list_dialogs", "get_history", "search_messages", "get_reply_context", "send_message"}:
+        if operation not in {"list_dialogs", "get_history", "search_messages", "get_reply_context",
+                             "view_photo", "transcribe_audio", "send_message"}:
             return {"error": "unknown_tool"}
         async with self.lock:
             try:
                 self.gate.check()
-                return bounded(await asyncio.wait_for(getattr(self, operation)(*args, **kwargs), 20))
+                timeout = MEDIA_TIMEOUT_SECONDS if operation in {"view_photo", "transcribe_audio"} else 20
+                result = await asyncio.wait_for(getattr(self, operation)(*args, **kwargs), timeout)
+                if isinstance(result, ImageResult):
+                    if (not isinstance(result.data, bytes) or result.mime_type != "image/jpeg" or
+                            len(result.data) > MAX_IMAGE_PREVIEW_BYTES or
+                            ((len(result.data) + 2) // 3) * 4 + 8192 > MAX_MEDIA_RESPONSE_BYTES):
+                        raise Denied("image_preview_too_large")
+                    return result
+                return bounded(result)
             except Denied as exc:
                 result = {"error": exc.code}
                 if exc.retry_after is not None:
                     result["retry_after_seconds"] = exc.retry_after
                 return result
             except TimeoutError:
-                return {"error": "delivery_unknown" if operation == "send_message" else "telegram_timeout"}
+                return {"error": "delivery_unknown" if operation == "send_message" else
+                        ("media_timeout" if operation in {"view_photo", "transcribe_audio"} else "telegram_timeout")}
             except Exception as exc:
                 # Inspect structured flood fields only; never return/log repr or args.
                 if type(exc).__name__ in {"FloodWaitError", "SlowModeWaitError", "FloodPremiumWaitError"}:
                     seconds = max(1, int(getattr(exc, "seconds", 60)))
                     self.gate.flood(seconds)
                     return {"error": "telegram_rate_limited", "retry_after_seconds": seconds}
-                return {"error": "delivery_unknown" if operation == "send_message" else "telegram_unavailable"}
+                return {"error": "delivery_unknown" if operation == "send_message" else
+                        ("media_unavailable" if operation in {"view_photo", "transcribe_audio"} else "telegram_unavailable")}
+
+    async def view_photo(self, peer_id, message_id):
+        integer(message_id, 1, 2**31 - 1)
+        target = await self._resolve(peer_id, allow_broadcast=True)
+        key = ("photo", target, message_id)
+        cached = self.media_cache.get(key)
+        if cached is not None:
+            return cached
+        fetch = getattr(self.backend, "fetch_media_file", None)
+        if fetch is None:
+            raise Denied("media_unavailable")
+        with temporary_media_dir() as directory:
+            path = Path(directory) / "telegram-photo"
+            await fetch(target, message_id, kind="photo", destination=path,
+                        max_bytes=MAX_IMAGE_INPUT_BYTES)
+            result = await preview_image(path)
+        self.media_cache.put(key, result)
+        return result
+
+    @staticmethod
+    def _check_audio_mime(kind, declared_mime):
+        if declared_mime is None:
+            return
+        if not isinstance(declared_mime, str) or len(declared_mime) > 96:
+            raise Denied("audio_mime_mismatch")
+        declared = declared_mime.strip().lower().split(";", 1)[0]
+        accepted = {
+            "ogg-opus": {"audio/ogg", "application/ogg", "audio/opus", "application/octet-stream"},
+            "mp3": {"audio/mpeg", "audio/mp3", "audio/x-mp3", "application/octet-stream"},
+            "mp4": {"audio/mp4", "audio/m4a", "audio/x-m4a", "video/mp4", "application/octet-stream"},
+            "wav": {"audio/wav", "audio/x-wav", "audio/wave", "application/octet-stream"},
+            "webm": {"audio/webm", "video/webm", "application/octet-stream"},
+        }
+        if declared not in accepted[kind]:
+            raise Denied("audio_mime_mismatch")
+
+    async def transcribe_audio(self, peer_id, message_id):
+        if self.transcription.provider != "openai" or self.transcriber is None:
+            raise Denied("transcription_disabled")
+        integer(message_id, 1, 2**31 - 1)
+        target = await self._resolve(peer_id, allow_broadcast=True)
+        key = ("transcript", target, message_id, "openai", self.transcription.max_duration_seconds)
+        cached = self.media_cache.get(key)
+        if cached is not None:
+            text, transcript_truncated = cached
+            return {"peer_id": target, "message_id": message_id, "transcript": text,
+                    "transcript_truncated": transcript_truncated, "untrusted_content": True,
+                    "provider": "openai", "cached": True}
+        fetch = getattr(self.backend, "fetch_media_file", None)
+        if fetch is None:
+            raise Denied("media_unavailable")
+        with temporary_media_dir() as directory:
+            workdir = Path(directory)
+            source = workdir / "telegram-audio"
+            metadata = await fetch(target, message_id, kind="audio", destination=source,
+                                   max_bytes=MAX_AUDIO_INPUT_BYTES)
+            declared_duration = metadata.get("declared_duration") if isinstance(metadata, dict) else None
+            if type(declared_duration) is not int or not 1 <= declared_duration <= self.transcription.max_duration_seconds:
+                raise Denied("audio_too_long" if type(declared_duration) is int else "audio_duration_unavailable")
+            actual_kind = sniff_audio_kind(source)
+            self._check_audio_mime(actual_kind, metadata.get("declared_mime"))
+            upload, filename, mime_type, duration = await prepare_audio(
+                source, workdir, max_seconds=self.transcription.max_duration_seconds)
+            if duration > self.transcription.max_duration_seconds:
+                raise Denied("audio_too_long")
+            billable_seconds = max(1, math.ceil(duration))
+            if self.quotas is None:
+                raise Denied("transcription_budget_unavailable")
+            try:
+                self.quotas.reserve_transcription(
+                    billable_seconds, self.transcription.monthly_seconds, self.clock())
+            except Denied:
+                raise
+            except Exception:
+                raise Denied("transcription_budget_unavailable") from None
+            try:
+                transcript = await self.transcriber.transcribe(
+                    upload, filename=filename, mime_type=mime_type)
+            except Denied:
+                raise
+            except Exception:
+                raise Denied("transcription_provider_error") from None
+        if not isinstance(transcript, str):
+            raise Denied("transcription_provider_error")
+        transcript_truncated = len(transcript) > MAX_TRANSCRIPT_CHARS
+        transcript = transcript[:MAX_TRANSCRIPT_CHARS]
+        self.media_cache.put(key, (transcript, transcript_truncated))
+        return {"peer_id": target, "message_id": message_id, "transcript": transcript,
+                "transcript_truncated": transcript_truncated, "untrusted_content": True,
+                "provider": "openai", "cached": False}
 
     async def _resolve(self, target, *, allow_broadcast=False, return_type=False):
         target = validate_peer_id(target)

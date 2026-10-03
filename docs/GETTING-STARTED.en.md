@@ -29,15 +29,29 @@ This guide describes how to run a local, read-only MCP for personal Telegram cha
 
 ## What the server does
 
-In `--read-only` mode, the server exposes four tools: list dialogs, read a selected dialog’s history, search within it, and get reply context. Each request is checked against an OAuth access token and is bounded by size and rate. Treat Telegram content as untrusted data.
+In `--read-only` mode, the server exposes six tools: list dialogs, read a selected dialog’s history, search within it, get reply context, view one explicitly requested photo, and optionally transcribe one explicitly requested audio attachment. Each request is checked against an OAuth access token and is bounded by size and rate. Treat Telegram content as untrusted data.
 
 The code also contains a separate `send_message` path when read-only mode is disabled and a permission plus exact recipient grant are configured. This guide does not enable it, and live Telegram sending has not been verified. Do not activate it for the read-only setup described here. See [server.py](../src/telegram_assistant/server.py), [security.py](../src/telegram_assistant/security.py), and the [service tests](../tests/test_service.py) for implementation details. The separate local operator controls are described in the [send policy guide](SENDING-POLICY.en.md).
 
 Broadcast channels are hidden by default. The source has an internal read-only allowlist hook for exactly one channel, but it is disabled and cannot be configured through the public example. Do not enable it without checking the exact channel and the owner's rights. `--read-only` does not enable sending.
 
+## Explicit media tools
+
+`view_photo(peer_id, message_id)` fetches only the photo attached to that exact message. History, search, and reply context still return text/captions and `has_media`; they never download attachments. The server checks the Telegram size metadata and the actual image signature, rejects inputs over 8 MiB or 12 megapixels, creates a local JPEG preview no wider or taller than 1,280 pixels and no larger than 256 KiB, then returns a native MCP `ImageContent`. Only this tool's HTTP response may use the separate 512 KiB envelope cap; the existing 48 KiB cap remains for every other call. Preview/result caching is in memory for up to five minutes and raw temporary files are removed at the end of the call.
+
+`transcribe_audio(peer_id, message_id)` is present but **off by default**. It accepts Telegram voice/audio documents only, checks the actual file signature and codec, caps the input at 20 MiB and at most five minutes, and caches only the transcript in memory for up to five minutes. Telegram OGG/Opus voice notes are remuxed locally to WebM with an audio stream copy; the audio is not decoded for speech recognition. This uses `ffmpeg`/`ffprobe`, which are installed in the example Docker image. The selected audio is sent to the configured OpenAI transcription endpoint only after an explicit tool call and a persistent monthly budget reservation. No other provider or local Whisper/ML runs. The selected model is `gpt-4o-mini-transcribe`. OpenAI's [current file transcription guide](https://developers.openai.com/api/docs/guides/speech-to-text) lists MP3, MP4, MPEG, MPGA, M4A, WAV, and WebM inputs, so the OGG/Opus remux is needed for that provider.
+
+To enable it, make a private API-key file using your secret manager or another hidden input method. Do not place the key in source, `.env`, command-line arguments, or logs. The file must be a regular, non-symlink file owned by the server process with mode `0600` or stricter. For the example container, mount that file read-only and ensure its owner matches the configured container UID (`10001`). Then add these live-server arguments:
+
+    --transcription-provider openai \
+    --transcription-key-file /run/assistant/openai_api_key \
+    --transcription-monthly-seconds 3600
+
+`--transcription-monthly-seconds` is a UTC calendar-month cap in audio seconds, persisted in the existing quota database. The default is zero, so enabling the provider also requires an explicit positive budget. A reservation is kept even if the provider fails, which prevents retry loops from exceeding the configured usage cap. `--transcription-max-duration-seconds` can lower the five-minute per-file maximum. Set the provider-side account spend limit separately: audio seconds bound usage but are not a dollar-denominated bill cap. Before enabling, decide which messages may be sent to OpenAI, the monthly budget, and the safe key provisioning method. Do not use real audio for local compatibility tests.
+
 ## 1. Install the project and run tests
 
-Python 3.11 or newer and Linux/macOS with a normal controlling terminal are needed for the login helper. PTY tests also need access to `/dev/tty`, which a restricted sandbox may block. Install dependencies in a virtual environment and run tests locally:
+Python 3.11 or newer and Linux/macOS with a normal controlling terminal are needed for the login helper. Media previews and OGG/Opus remux also require `ffmpeg` and `ffprobe` on local hosts; the Docker image installs them. PTY tests also need access to `/dev/tty`, which a restricted sandbox may block. Install dependencies in a virtual environment and run tests locally:
 
     python3 -m venv .venv
     .venv/bin/python -m pip install -r requirements.lock
@@ -151,7 +165,7 @@ Errors are separated by layer:
 - `telegram_rate_limited` — typed Telegram FloodWait; follow `retry_after_seconds`;
 - file or session-lock error — local permissions or a competing process, not an OAuth reconnect.
 
-A message's text is limited to 2,000 characters; `text_truncated=true` indicates truncation. JSON responses are limited to 48 KiB. The service does not export full history.
+A message's text is limited to 2,000 characters; `text_truncated=true` indicates truncation. JSON responses are limited to 48 KiB, except the explicit `view_photo` MCP image response, whose JSON envelope is capped at 512 KiB. The service does not export full history.
 
 The public metadata route does not confirm that the Telegram session works. Access to a particular user's channels must also be checked separately: broadcast channels are filtered by default.
 
