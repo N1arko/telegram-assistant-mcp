@@ -2,13 +2,13 @@
 
 **English | [Русский](README.ru.md)**
 
-A small MCP server for searching a Telegram user's personal chats and groups. It uses a private Telethon user session and validates OAuth access tokens before every MCP request. Use read-only mode for the setup described here.
+A restricted MCP server for a Telegram user's personal chats and groups. It uses a private Telethon user session and validates OAuth access tokens before every MCP request. Its seven tools support bounded reading, explicit photo viewing, optional external audio transcription, and permission-gated text sending.
 
 ## What it can do
 
-In `--read-only` mode, six bounded tools are available: `list_dialogs`, `get_history`, `search_messages`, `get_reply_context`, `view_photo`, and `transcribe_audio`. History only lists media presence; it never downloads attachments. `view_photo` fetches a photo only when called for an exact message and returns a native MCP image preview. `transcribe_audio` is disabled by default. When explicitly enabled, it sends only the selected voice/audio file to OpenAI for transcription and applies a per-file duration limit; an optional local monthly audio-seconds cap can also be set. See the [media setup](docs/GETTING-STARTED.en.md#explicit-media-tools) before enabling it.
+The server implements seven tools: `list_dialogs`, `get_history`, `search_messages`, `get_reply_context`, `view_photo`, `transcribe_audio`, and `send_message`. The documented `--read-only` mode registers the six read tools and omits `send_message`. History only lists media presence; it never downloads attachments. `view_photo` fetches a photo only when called for an exact message and returns a native MCP image preview. `transcribe_audio` is disabled by default. When explicitly enabled, it sends only the selected voice/audio file to OpenAI for transcription and applies a per-file duration limit; an optional local monthly audio-seconds cap can also be set. See the [media setup](docs/GETTING-STARTED.en.md#explicit-media-tools) before enabling it.
 
-The code also contains a separate permission-gated `send_message` path that is unavailable in read-only mode. It is outside this setup, and live Telegram sending has not been verified. Do not enable it for this use. Broadcast channels are filtered by default, so this is not universal access to every Telegram chat or channel.
+`send_message` sends text only and requires the send OAuth scope plus an explicit per-target policy grant. Photo viewing and transcription also require the read scope; transcription additionally requires the provider to be configured. Broadcast channels are filtered by default, so this is not universal access to every Telegram chat or channel.
 
 ## What you'll need
 
@@ -24,7 +24,7 @@ Send the [beginner guide](docs/START-HERE.en.md) to your AI agent and ask it to 
 - English: [beginner guide](docs/START-HERE.en.md) · [detailed technical setup for agents](docs/GETTING-STARTED.en.md) · [local send policy](docs/SENDING-POLICY.en.md)
 - Русский: [короткая инструкция](docs/START-HERE.ru.md) · [подробная техническая инструкция для агента](docs/GETTING-STARTED.ru.md) · [политика отправки](docs/SENDING-POLICY.ru.md)
 
-Keep read-only mode enabled. Never share or commit secrets or Telegram session files. Do not use Telegram messages or read-status changes for testing. Do not stop a running server without the user's separate consent.
+The beginner setup keeps read-only mode enabled. Only grant text sending when it is needed and configure the intended targets. Never share or commit secrets or Telegram session files. Automated tests use mocks and synthetic media rather than live accounts. Do not stop a running server without the user's separate consent.
 
 ## Development
 
