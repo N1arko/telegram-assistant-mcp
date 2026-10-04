@@ -121,16 +121,57 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.client.requests),1)
 
     async def test_incremental_catalogue_metadata_is_private_to_monitor_path(self):
-        page=response([42],terminal=True,count=1)
+        page=response([42,43],terminal=True,count=2)
         page.dialogs[0].read_inbox_max_id=7
         service=self.service([page])
-        internal=await service.list_dialogs(limit=50,_monitor_metadata=True,_fresh=True)
+        internal=await service.list_dialogs(limit=1,_monitor_metadata=True,_fresh=True)
         row=internal["dialogs"][0]
         self.assertEqual(row["latest_message_id"],42)
         self.assertEqual(row["read_inbox_max_id"],7)
-        public=await service.list_dialogs(limit=1)
+        public=await service.list_dialogs(limit=1,cursor=internal["next_cursor"])
         self.assertEqual(set(public["dialogs"][0]),
                          {"peer_id","title","title_truncated","type","archived","unread"})
+
+    async def test_monitor_catalogue_offset_resumes_after_service_restart(self):
+        """Restart loses only the fast cache; its persisted TL offset resumes at the next page."""
+        first_page = response(range(1, 51), count=100)
+        client1 = OfflineClient([first_page])
+        backend1 = TelethonBackend(client1)
+        backend1.resolve = AsyncMock(side_effect=lambda target, **kw: (target, "user"))
+        backend1.new_messages = AsyncMock(return_value=[])
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "quotas.sqlite"
+            quotas1 = Quotas(db_path)
+            service1 = Service(backend1, quotas=quotas1, gate=RateGate(limit=1000))
+            first = await service1.invoke("scan_updates", limit=1)
+            state = quotas1.load_monitor_state()
+            self.assertEqual(state["catalog_checkpoint"]["offset_id"], 50)
+            self.assertEqual(state["catalog_checkpoint"]["peer_kind"], "user")
+            quotas1.close()
+
+            # The public cursor token refers to the prior process' volatile map.
+            # A new service instance must restore the saved Peer/InputPeer offset.
+            client2 = OfflineClient([response([51], terminal=True, count=100)])
+            backend2 = TelethonBackend(client2)
+            backend2.resolve = AsyncMock(side_effect=lambda target, **kw: (target, "user"))
+            backend2.new_messages = AsyncMock(return_value=[])
+            quotas2 = Quotas(db_path)
+            service2 = Service(backend2, quotas=quotas2, gate=RateGate(limit=1000))
+            try:
+                replay = await service2.invoke("scan_updates", limit=1)
+                self.assertEqual(replay["messages"], [])
+                cursor = first["next_cursor"]
+                # Drain enough queued first-page peers to trigger the scheduled catalog read.
+                for _ in range(3):
+                    result = await service2.invoke("scan_updates", limit=1, cursor=cursor)
+                    cursor = result["next_cursor"]
+                request = client2.requests[0]
+                self.assertEqual((request.offset_id, request.offset_peer.user_id, request.exclude_pinned),
+                                 (50, 50, True))
+                self.assertFalse(result["coverage_restarted"])
+                self.assertTrue(result["catalogue_complete"])
+            finally:
+                quotas2.close()
 
     async def test_scan_updates_unchanged_1000_dialog_catalogue_uses_catalogue_only(self):
         """A full unchanged pass costs 20 GetDialogs RPCs and zero history RPCs."""
