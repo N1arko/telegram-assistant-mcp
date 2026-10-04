@@ -380,7 +380,9 @@ class Service:
             try:
                 listing = await self.list_dialogs(
                     archived=None, limit=50, cursor=state["catalog_cursor"],
-                    _monitor_metadata=True, _fresh=fresh)
+                    _monitor_metadata=True, _fresh=fresh,
+                    _checkpoint=(state["catalog_checkpoint"]
+                                 if state["catalog_cursor"] is None else None))
             except Denied as exc:
                 if (state["catalog_cursor"] is None or
                         exc.code not in {"invalid_cursor", "cursor_expired_or_mismatched"}):
