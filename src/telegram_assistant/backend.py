@@ -91,13 +91,62 @@ class TelethonBackend:
                 isinstance(username, str) and username.casefold() == allowed_username.casefold() and
                 getattr(entity, "creator", False) is True)
 
-    def start_dialogs(self, archived):
+    def start_dialogs(self, archived, checkpoint=None):
         # Retain the pinned SDK iterator's offsets/seen set, but constrain each
         # catalogue fetch through a per-listing proxy. Never collect all dialogs.
         budget = _DialogBudget(self)
-        iterator = self.client.iter_dialogs(limit=None, archived=archived).__aiter__()
+        options = {}
+        if checkpoint is not None:
+            from datetime import datetime, timezone
+            from telethon import types
+            peer_kind = checkpoint.get("peer_kind")
+            peer_id = checkpoint.get("peer_id")
+            access_hash = checkpoint.get("access_hash")
+            if peer_kind == "user":
+                offset_peer = types.InputPeerUser(peer_id, access_hash)
+            elif peer_kind == "channel":
+                offset_peer = types.InputPeerChannel(peer_id, access_hash)
+            elif peer_kind == "chat":
+                offset_peer = types.InputPeerChat(peer_id)
+            elif peer_kind == "self":
+                offset_peer = types.InputPeerSelf()
+            else:
+                raise Denied("monitor_state_unavailable")
+            offset_date = (datetime.fromtimestamp(checkpoint["offset_date"], timezone.utc)
+                           if checkpoint["offset_date"] else None)
+            options = {"offset_date": offset_date, "offset_id": checkpoint["offset_id"],
+                       "offset_peer": offset_peer, "ignore_pinned": True}
+        iterator = self.client.iter_dialogs(limit=None, archived=archived, **options).__aiter__()
         iterator.client = budget
         return DialogListing(iterator, budget, archived)
+
+    @staticmethod
+    def dialog_checkpoint(state):
+        """Return a small durable SDK offset, never a message body or entity cache."""
+        from telethon import types
+        # Pinned responses can exceed request.limit. The iterator may still have
+        # buffered dialogs beyond the page returned to the caller; its request
+        # then points past those unseen rows, so only persist at a clean seam.
+        if state.iterator.buffer is None or state.iterator.index < len(state.iterator.buffer):
+            return None
+        request = getattr(state.iterator, "request", None)
+        if request is None or not request.offset_id or request.offset_peer is None:
+            return None
+        peer = request.offset_peer
+        if isinstance(peer, types.InputPeerUser):
+            peer_kind, peer_id, access_hash = "user", peer.user_id, peer.access_hash
+        elif isinstance(peer, types.InputPeerChannel):
+            peer_kind, peer_id, access_hash = "channel", peer.channel_id, peer.access_hash
+        elif isinstance(peer, types.InputPeerChat):
+            peer_kind, peer_id, access_hash = "chat", peer.chat_id, None
+        elif isinstance(peer, types.InputPeerSelf):
+            peer_kind, peer_id, access_hash = "self", None, None
+        else:
+            return None
+        offset_date = request.offset_date
+        return {"offset_id": int(request.offset_id),
+                "offset_date": int(offset_date.timestamp()) if offset_date else 0,
+                "peer_kind": peer_kind, "peer_id": peer_id, "access_hash": access_hash}
 
     def _remember(self, entity):
         from telethon.utils import get_peer_id

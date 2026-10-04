@@ -334,7 +334,10 @@ class Quotas:
         checkpoint_columns = {row[1] for row in self.db.execute("PRAGMA table_info(monitor_checkpoints)")}
         if "initial_window_limited" not in checkpoint_columns:
             self.db.execute("ALTER TABLE monitor_checkpoints ADD COLUMN initial_window_limited INTEGER NOT NULL DEFAULT 0")
-        self.db.execute("CREATE TABLE IF NOT EXISTS monitor_pending (sequence INTEGER PRIMARY KEY AUTOINCREMENT, peer INTEGER NOT NULL UNIQUE, after_id INTEGER NOT NULL, through_id INTEGER NOT NULL, peer_type TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS monitor_pending (sequence INTEGER PRIMARY KEY AUTOINCREMENT, peer INTEGER NOT NULL UNIQUE, after_id INTEGER NOT NULL, through_id INTEGER NOT NULL, peer_type TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 0)")
+        pending_columns = {row[1] for row in self.db.execute("PRAGMA table_info(monitor_pending)")}
+        if "priority" not in pending_columns:
+            self.db.execute("ALTER TABLE monitor_pending ADD COLUMN priority INTEGER NOT NULL DEFAULT 0")
         self.db.execute("CREATE TABLE IF NOT EXISTS monitor_state (id INTEGER PRIMARY KEY CHECK(id=1), state TEXT NOT NULL)")
         self.db.commit()
 
@@ -411,26 +414,62 @@ class Quotas:
 
     @staticmethod
     def _default_monitor_state():
-        return {"version": 1, "catalog_cursor": None, "catalog_finished": False,
+        return {"version": 3, "catalog_cursor": None, "catalog_checkpoint": None,
+                "catalog_calls_since_refresh": 0, "catalog_finished": False,
                 "catalog_complete": False, "catalog_truncated": False,
-                "coverage_restarted": False, "sweep_started": False,
+                "catalog_sweeps_completed": False, "coverage_restarted": False, "sweep_started": False,
                 "last_acked_cursor": None, "inflight": None}
 
     @classmethod
     def _validate_monitor_state(cls, state):
-        fields = {"version", "catalog_cursor", "catalog_finished", "catalog_complete",
+        # Upgrade the schema written by earlier releases without discarding
+        # durable delivery/checkpoint state.
+        old_fields = {"version", "catalog_cursor", "catalog_finished", "catalog_complete",
+                      "catalog_truncated", "coverage_restarted", "sweep_started",
+                      "last_acked_cursor", "inflight"}
+        if isinstance(state, dict) and state.get("version") == 1 and set(state) == old_fields:
+            state = {**state, "version": 2, "catalog_checkpoint": None,
+                     "catalog_calls_since_refresh": 0}
+        v2_fields = {"version", "catalog_cursor", "catalog_checkpoint", "catalog_calls_since_refresh",
+                     "catalog_finished", "catalog_complete", "catalog_truncated",
+                     "coverage_restarted", "sweep_started", "last_acked_cursor", "inflight"}
+        if isinstance(state, dict) and state.get("version") == 2 and set(state) == v2_fields:
+            state = {**state, "version": 3, "catalog_sweeps_completed": False}
+        fields = {"version", "catalog_cursor", "catalog_checkpoint", "catalog_calls_since_refresh",
+                  "catalog_finished", "catalog_complete", "catalog_sweeps_completed",
                   "catalog_truncated", "coverage_restarted", "sweep_started",
                   "last_acked_cursor", "inflight"}
         if (not isinstance(state, dict) or set(state) != fields or
-                type(state.get("version")) is not int or state["version"] != 1):
+                type(state.get("version")) is not int or state["version"] != 3):
             raise Denied("monitor_state_unavailable")
-        for name in ("catalog_finished", "catalog_complete", "catalog_truncated",
+        for name in ("catalog_finished", "catalog_complete", "catalog_sweeps_completed", "catalog_truncated",
                      "coverage_restarted", "sweep_started"):
             if type(state[name]) is not bool:
                 raise Denied("monitor_state_unavailable")
         for name in ("catalog_cursor", "last_acked_cursor"):
             value = state[name]
             if value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 128):
+                raise Denied("monitor_state_unavailable")
+        if (type(state["catalog_calls_since_refresh"]) is not int or
+                not 0 <= state["catalog_calls_since_refresh"] <= 2):
+            raise Denied("monitor_state_unavailable")
+        checkpoint = state["catalog_checkpoint"]
+        if checkpoint is not None:
+            checkpoint_fields = {"offset_id", "offset_date", "peer_kind", "peer_id", "access_hash"}
+            if not isinstance(checkpoint, dict) or set(checkpoint) != checkpoint_fields:
+                raise Denied("monitor_state_unavailable")
+            if (type(checkpoint["offset_id"]) is not int or not 1 <= checkpoint["offset_id"] < 2**31 or
+                    type(checkpoint["offset_date"]) is not int or not 0 <= checkpoint["offset_date"] < 2**53 or
+                    checkpoint["peer_kind"] not in {"user", "channel", "chat", "self"}):
+                raise Denied("monitor_state_unavailable")
+            peer_id, access_hash = checkpoint["peer_id"], checkpoint["access_hash"]
+            if checkpoint["peer_kind"] == "self":
+                if peer_id is not None or access_hash is not None:
+                    raise Denied("monitor_state_unavailable")
+            elif (type(peer_id) is not int or not 1 <= peer_id < 2**63 or
+                  (checkpoint["peer_kind"] in {"user", "channel"} and
+                   (type(access_hash) is not int or not -(2**63) <= access_hash < 2**63)) or
+                  (checkpoint["peer_kind"] == "chat" and access_hash is not None)):
                 raise Denied("monitor_state_unavailable")
         delivery = state["inflight"]
         if delivery is not None:
@@ -484,7 +523,7 @@ class Quotas:
         self.db.execute("INSERT OR REPLACE INTO monitor_state VALUES(1, ?)", (encoded,))
         self.db.commit()
 
-    def observe_monitor_dialogs(self, rows):
+    def observe_monitor_dialogs(self, rows, *, prioritize_new=False):
         """Persist bounded catalogue observations and enqueue unseen message ranges."""
         if not isinstance(rows, (list, tuple)) or len(rows) > 50:
             raise Denied("monitor_state_unavailable")
@@ -527,14 +566,17 @@ class Quotas:
                 if latest <= checkpoint_id:
                     continue
                 pending = self.db.execute(
-                    "SELECT sequence,after_id,through_id FROM monitor_pending WHERE peer=?", (peer,)).fetchone()
+                    "SELECT sequence,after_id,through_id,priority FROM monitor_pending WHERE peer=?", (peer,)).fetchone()
                 if pending is None:
                     self.db.execute(
-                        "INSERT INTO monitor_pending(peer,after_id,through_id,peer_type) VALUES(?,?,?,?)",
-                        (peer, checkpoint_id, latest, peer_type))
+                        "INSERT INTO monitor_pending(peer,after_id,through_id,peer_type,priority) VALUES(?,?,?,?,?)",
+                        (peer, checkpoint_id, latest, peer_type,
+                         int(prioritize_new or checkpoint is not None)))
                 else:
-                    self.db.execute("UPDATE monitor_pending SET through_id=MAX(through_id,?) WHERE peer=?",
-                                    (latest, peer))
+                    if latest > pending[2]:
+                        self.db.execute(
+                            "UPDATE monitor_pending SET through_id=?,priority=1 WHERE peer=?",
+                            (latest, peer))
             self.db.commit()
         except BaseException:
             self.db.rollback()
@@ -542,7 +584,8 @@ class Quotas:
 
     def next_monitor_pending(self):
         row = self.db.execute(
-            "SELECT peer,after_id,through_id,peer_type FROM monitor_pending ORDER BY sequence LIMIT 1").fetchone()
+            "SELECT peer,after_id,through_id,peer_type FROM monitor_pending "
+            "ORDER BY priority DESC,sequence LIMIT 1").fetchone()
         return (None if row is None else
                 {"peer_id": row[0], "after_id": row[1], "through_id": row[2], "peer_type": row[3]})
 

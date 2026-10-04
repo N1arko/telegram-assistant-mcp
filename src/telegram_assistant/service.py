@@ -213,7 +213,7 @@ class Service:
         return (target, resolved[1]) if return_type else target
 
     async def list_dialogs(self, archived=None, limit=20, cursor=None, *,
-                           _monitor_metadata=False, _fresh=False):
+                           _monitor_metadata=False, _fresh=False, _checkpoint=None):
         integer(limit, 1, 50)
         if archived is not None and type(archived) is not bool:
             raise Denied("invalid_argument")
@@ -231,11 +231,18 @@ class Service:
             # Reuse the cached prefix across chats instead of restarting a
             # Telegram catalogue scan on each initial request.
             snap = None if _fresh else next((key for key, value in reversed(self.snapshots.items())
-                                             if value['archived'] == archived), None)
+                                             if value['archived'] == archived and
+                                             value.get('monitor', False) == _monitor_metadata), None)
             if snap is None:
                 snap = secrets.token_urlsafe(24)
-                self.snapshots[snap] = {'expires': now + 300, 'archived': archived,
-                                        'state': self.backend.start_dialogs(archived), 'blocks': []}
+                start = self.backend.start_dialogs
+                if _checkpoint is not None:
+                    dialog_state = start(archived, checkpoint=_checkpoint)
+                else:
+                    dialog_state = start(archived)
+                self.snapshots[snap] = {'expires': now + (7 * 24 * 60 * 60 if _monitor_metadata else 300),
+                                        'archived': archived, 'monitor': _monitor_metadata,
+                                        'state': dialog_state, 'blocks': []}
                 while len(self.snapshots) > 4:
                     self.snapshots.popitem(last=False)
             block_index, start = 0, 0
@@ -281,6 +288,12 @@ class Service:
             while len(self.cursors) > 256:
                 self.cursors.popitem(last=False)
         payload['listing_complete'] = payload['next_cursor'] is None and block['done'] and not block['truncated']
+        if _monitor_metadata:
+            checkpoint = None
+            get_checkpoint = getattr(self.backend, "dialog_checkpoint", None)
+            if payload["next_cursor"] is not None and get_checkpoint is not None:
+                checkpoint = get_checkpoint(listing["state"])
+            payload["monitor_checkpoint"] = checkpoint
         return payload
 
     def _monitor_output(self, messages, delivery, state, pending_count):
@@ -342,15 +355,21 @@ class Service:
         elif cursor != state["last_acked_cursor"]:
             raise Denied("invalid_cursor")
 
-        # Once one sweep has discovered a backlog, drain that durable queue
-        # before starting another catalogue sweep. This avoids one catalogue
-        # RPC on every message page during high-volume catch-up.
-        skip_catalogue = state["catalog_finished"] and self.quotas.monitor_pending_count() > 0
-        if not skip_catalogue:
+        # Keep discovery moving while a large old queue drains, but cap the
+        # catalogue at one RPC per three newly acknowledged scan calls. Empty
+        # queues and small catalogues still finish a sweep as quickly as one
+        # bounded page per call. New activity normally promotes its dialog to
+        # Telegram's newest-dialog page, so this gives a three-call freshness
+        # bound without spending one extra catalogue RPC on every backlog page.
+        pending_before = self.quotas.monitor_pending_count()
+        catalogue_due = (not state["sweep_started"] or pending_before == 0 or
+                         state["catalog_calls_since_refresh"] >= 2)
+        if catalogue_due:
             fresh = not state["sweep_started"]
             if state["catalog_finished"]:
                 state.update({"catalog_cursor": None, "catalog_finished": False,
                               "catalog_complete": False, "catalog_truncated": False,
+                              "catalog_checkpoint": None, "catalog_calls_since_refresh": 0,
                               "coverage_restarted": False, "sweep_started": True})
                 fresh = True
                 self.quotas.save_monitor_state(state)
@@ -361,25 +380,44 @@ class Service:
             try:
                 listing = await self.list_dialogs(
                     archived=None, limit=50, cursor=state["catalog_cursor"],
-                    _monitor_metadata=True, _fresh=fresh)
+                    _monitor_metadata=True, _fresh=fresh,
+                    _checkpoint=(state["catalog_checkpoint"]
+                                 if state["catalog_cursor"] is None else None))
             except Denied as exc:
                 if (state["catalog_cursor"] is None or
                         exc.code not in {"invalid_cursor", "cursor_expired_or_mismatched"}):
                     raise
-                # The catalogue cursor is deliberately ephemeral (five minute
-                # cache). Durable per-peer watermarks survive; restart the sweep.
+                # The in-memory snapshot cursor is only a fast path. Resume from
+                # the last stable Telethon offset persisted with monitor state,
+                # or restart from page one if a backend cannot provide one.
+                checkpoint = state["catalog_checkpoint"]
                 state.update({"catalog_cursor": None, "catalog_finished": False,
                               "catalog_complete": False, "catalog_truncated": False,
-                              "coverage_restarted": True, "sweep_started": True})
+                              "catalog_calls_since_refresh": 0,
+                              "coverage_restarted": checkpoint is None, "sweep_started": True})
+                if checkpoint is None:
+                    state["catalog_checkpoint"] = None
                 self.quotas.save_monitor_state(state)
                 listing = await self.list_dialogs(archived=None, limit=50, cursor=None,
-                                                  _monitor_metadata=True, _fresh=True)
+                                                  _monitor_metadata=True, _fresh=True,
+                                                  _checkpoint=checkpoint)
 
-            self.quotas.observe_monitor_dialogs(listing["dialogs"])
+            self.quotas.observe_monitor_dialogs(
+                listing["dialogs"], prioritize_new=state["catalog_sweeps_completed"])
             state["catalog_cursor"] = listing["next_cursor"]
             state["catalog_finished"] = listing["next_cursor"] is None
             state["catalog_complete"] = bool(listing["listing_complete"])
             state["catalog_truncated"] = state["catalog_truncated"] or bool(listing["scan_truncated"])
+            if state["catalog_finished"] and state["catalog_complete"]:
+                state["catalog_sweeps_completed"] = True
+            if state["catalog_finished"]:
+                state["catalog_checkpoint"] = None
+            elif listing.get("monitor_checkpoint") is not None:
+                state["catalog_checkpoint"] = listing["monitor_checkpoint"]
+            state["catalog_calls_since_refresh"] = 0
+            self.quotas.save_monitor_state(state)
+        else:
+            state["catalog_calls_since_refresh"] += 1
             self.quotas.save_monitor_state(state)
 
         pending = self.quotas.next_monitor_pending()

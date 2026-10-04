@@ -221,8 +221,11 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
             next_page = await service2.invoke(
                 "scan_updates", limit=1, cursor=first["next_cursor"])
             self.assertEqual([m["message_id"] for m in next_page["messages"]], [2])
-            self.assertTrue(next_page["coverage_restarted"])
-            self.assertFalse(next_page["coverage_complete"])
+            self.assertFalse(next_page["coverage_restarted"])
+            after_backlog = await service2.invoke(
+                "scan_updates", limit=1, cursor=next_page["next_cursor"])
+            self.assertTrue(after_backlog["coverage_restarted"])
+            self.assertFalse(after_backlog["coverage_complete"])
             self.assertEqual(backend2.catalog_calls, [50])
         finally:
             quotas2.close()
@@ -272,20 +275,78 @@ class MonitorTests(unittest.IsolatedAsyncioTestCase):
         finally:
             quotas.close()
 
-    async def test_five_minute_catalog_cursor_expiry_keeps_watermarks_and_reports_restart(self):
-        rows = [self.row(42, 2, 0)] + [self.row(i, 0, 0) for i in range(100, 150)]
-        backend = MonitorBackend(rows, {42: [message(1), message(2)]})
+    async def test_catalog_pages_survive_six_minute_gaps_while_backlog_drains(self):
+        """Nine 50-dialog pages complete across pauses; discovery is one third of calls."""
+        rows = [self.row(peer, 1, 0) for peer in range(100, 546)]
+        messages = {row["peer_id"]: [message(1, peer_id=row["peer_id"])] for row in rows}
+        backend = MonitorBackend(rows, messages)
         now = [1000]
         service, quotas = self.service(backend, clock=lambda: now[0])
         try:
-            first = await service.invoke("scan_updates", limit=1)
-            now[0] += 301
-            continued = await service.invoke("scan_updates", limit=1, cursor=first["next_cursor"])
-            self.assertEqual([m["message_id"] for m in continued["messages"]],[2])
-            self.assertTrue(continued["coverage_restarted"])
-            self.assertEqual(backend.catalog_calls,[50,50])
+            cursor = None
+            for _ in range(25):
+                result = await service.invoke("scan_updates", limit=1, cursor=cursor)
+                self.assertNotIn("error", result)
+                cursor = result["next_cursor"]
+                now[0] += 360
+            self.assertEqual(backend.catalog_calls, [50] * 9)
+            self.assertEqual(quotas.load_monitor_state()["catalog_calls_since_refresh"], 0)
+            self.assertIsNotNone(quotas.db.execute(
+                "SELECT 1 FROM monitor_pending WHERE peer=545").fetchone())
         finally:
             quotas.close()
+
+    async def test_fresh_existing_peer_and_new_dialog_jump_ahead_of_old_backlog(self):
+        """A fresh sweep prioritizes a changed old peer and new dialog above stale bootstrap work."""
+        rows = [self.row(peer, 1, 0) for peer in range(100, 220)]
+        messages = {row["peer_id"]: [message(1, peer_id=row["peer_id"])] for row in rows}
+        messages[199] = [message(i, peer_id=199) for i in range(1, 21)]
+        next(row for row in rows if row["peer_id"] == 199)["latest_message_id"] = 20
+        backend = MonitorBackend(rows, messages)
+        now = [1000]
+        service, quotas = self.service(backend, clock=lambda: now[0])
+        try:
+            cursor = None
+            fresh_peer_message_seen_by = None
+            fresh_dialog_seen_by = None
+            for index in range(13):
+                if index == 7:
+                    newest = self.row(999, 1, 0)
+                    backend.rows.insert(0, newest)
+                    backend.types[999] = "user"
+                    backend.messages[999] = [message(1, peer_id=999)]
+                    updated = next(row for row in backend.rows if row["peer_id"] == 199)
+                    backend.rows.remove(updated)
+                    updated["latest_message_id"] = 21
+                    backend.rows.insert(1, updated)
+                    backend.messages[199].append(message(21, peer_id=199))
+                result = await service.invoke("scan_updates", limit=10, cursor=cursor)
+                self.assertNotIn("error", result)
+                if any(m["peer_id"] == 199 and m["message_id"] == 21 for m in result["messages"]):
+                    fresh_peer_message_seen_by = index + 1
+                if any(m["peer_id"] == 999 for m in result["messages"]):
+                    fresh_dialog_seen_by = index + 1
+                cursor = result["next_cursor"]
+                now[0] += 360
+            self.assertIsNotNone(fresh_peer_message_seen_by)
+            self.assertIsNotNone(fresh_dialog_seen_by)
+            self.assertLessEqual(fresh_peer_message_seen_by, 13)
+            self.assertLessEqual(fresh_dialog_seen_by, 13)
+            self.assertGreaterEqual(fresh_peer_message_seen_by, 10)
+            self.assertGreaterEqual(fresh_dialog_seen_by, 10)
+        finally:
+            quotas.close()
+
+    async def test_v1_monitor_state_is_upgraded_without_losing_ack_state(self):
+        old = {"version": 1, "catalog_cursor": "opaque", "catalog_finished": False,
+               "catalog_complete": False, "catalog_truncated": False,
+               "coverage_restarted": False, "sweep_started": True,
+               "last_acked_cursor": "acked", "inflight": None}
+        upgraded = Quotas._validate_monitor_state(old)
+        self.assertEqual(upgraded["version"], 3)
+        self.assertEqual(upgraded["catalog_cursor"], "opaque")
+        self.assertEqual(upgraded["last_acked_cursor"], "acked")
+        self.assertIsNone(upgraded["catalog_checkpoint"])
 
     async def test_flood_wait_is_reported_without_retry_loop_and_queue_is_kept(self):
         class FloodWaitError(Exception):
