@@ -147,6 +147,10 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
             state = quotas1.load_monitor_state()
             self.assertEqual(state["catalog_checkpoint"]["offset_id"], 50)
             self.assertEqual(state["catalog_checkpoint"]["peer_kind"], "user")
+            # Model a process death after an expired cursor was cleared but
+            # before the resumed offset's first page was saved.
+            state["catalog_cursor"] = None
+            quotas1.save_monitor_state(state)
             quotas1.close()
 
             # The public cursor token refers to the prior process' volatile map.
