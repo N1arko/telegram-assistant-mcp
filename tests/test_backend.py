@@ -46,6 +46,20 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.client.send_read_acknowledge.assert_not_awaited()
         self.client.download_media.assert_not_awaited()
         self.client.send_message.assert_not_awaited()
+
+    async def test_incremental_messages_use_bounded_oldest_first_id_range(self):
+        user=User(id=42)
+        self.backend._remember(user)
+        messages=[Message(id=i,peer_id=PeerUser(42),date=datetime.now(timezone.utc),
+                           message=f"m{i}",out=(i == 4)) for i in (4,2,3)]
+        self.client.get_messages.return_value=messages
+        rows=await self.backend.new_messages(42,after_id=1,through_id=4,limit=2)
+        self.client.get_messages.assert_awaited_once_with(
+            user,limit=3,min_id=1,max_id=5,reverse=True)
+        self.assertEqual([row["id"] for row in rows],[2,3,4])
+        self.assertTrue(rows[-1]["out"])
+        self.client.send_read_acknowledge.assert_not_awaited()
+        self.client.download_media.assert_not_awaited()
     async def test_send_plain_text_adapter_only_mock(self):
         self.backend.peers={42:User(id=42)}
         self.client.send_message.return_value=NS(id=100)

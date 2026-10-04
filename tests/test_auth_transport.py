@@ -157,7 +157,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                                    "method":method,"params":params or {}})
     async def test_all_mcp_methods_require_auth(self):
         for method,params in [("initialize",{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}),
-            ("tools/list",{}),("tools/call",{"name":"get_history","arguments":{"peer_id":42}})]:
+            ("tools/list",{}),("tools/call",{"name":"get_history","arguments":{"peer_id":42}}),
+            ("tools/call",{"name":"scan_updates","arguments":{"limit":1}})]:
             for token in [None,"invalid"]:
                 response=await self.rpc(method,params,token=token)
                 self.assertEqual(response.status_code,401,response.text)
@@ -179,7 +180,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code,200,response.text)
         names={t["name"] for t in response.json()["result"]["tools"]}
         self.assertEqual(names,{"list_dialogs","get_history","search_messages","get_reply_context",
-                               "view_photo","transcribe_audio","send_message","send_media"})
+                               "scan_updates","view_photo","transcribe_audio","send_message","send_media"})
         for name in ["set_policy","edit_message","delete_message","mark_as_read","download_media","transcribe_voice"]:
             result=await self.rpc("tools/call",{"name":name,"arguments":{}})
             self.assertTrue(result.json()["result"]["isError"])
@@ -219,6 +220,18 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m["message_id"] for m in payload["messages"]],[12,11,10])
         self.fake.history.assert_awaited_once()
         self.fake.read_receipt.assert_not_awaited()
+
+    async def test_scan_updates_transport_uses_read_scope_and_cursor_schema(self):
+        sample={"messages":[],"next_cursor":"synthetic-cursor","catalogue_complete":False,
+                "scan_truncated":False,"coverage_restarted":False,"queued_peers":0,
+                "coverage_complete":False,"untrusted_content":True}
+        self.service.scan_updates=AsyncMock(return_value=sample)
+        response=await self.rpc("tools/call",{"name":"scan_updates",
+            "arguments":{"limit":1,"cursor":"previous-cursor"}})
+        self.assertEqual(response.status_code,200,response.text)
+        payload=json.loads(response.json()["result"]["content"][0]["text"])
+        self.assertEqual(payload,sample)
+        self.service.scan_updates.assert_awaited_once_with(limit=1,cursor="previous-cursor")
     async def test_scope_and_policy_deny(self):
         for token,code in [("fake-read","send_scope_required"),("fake-write","send_denied")]:
             response=await self.rpc("tools/call",{"name":"send_message","arguments":{"peer_id":42,"text":"test"}},token=token)

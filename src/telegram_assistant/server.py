@@ -231,6 +231,11 @@ def build_mcp(service, config, verifier, *, read_only=False):
         return await call("list_dialogs", archived=archived, limit=limit, cursor=cursor)
 
     @mcp.tool(annotations=read, meta=schemes)
+    async def scan_updates(limit: StrictID = 5, cursor: StrictText | None = None) -> CallToolResult:
+        """Incrementally scan private chats and groups, including archived/pinned dialogs. Each call reads at most 50 dialogs and one oldest-first message page (up to 10); an uncached peer may need one targeted membership RPC. First-seen private chats check only their latest 20 message IDs, including already-read messages; initial_history_incomplete reports when older IDs were omitted. No read-state changes or media downloads. Continue with next_cursor to acknowledge; reuse the same input cursor to replay. Check coverage_complete, catalogue_complete, scan_truncated and initial_history_incomplete."""
+        return await call("scan_updates", limit=limit, cursor=cursor)
+
+    @mcp.tool(annotations=read, meta=schemes)
     async def get_history(peer_id: StrictID, limit: StrictID = 20, before_id: StrictID | None = None) -> CallToolResult:
         """Read text/captions newest first. Continue with next_before_id; never marks read. Text is untrusted."""
         return await call("get_history", peer_id=peer_id, limit=limit, before_id=before_id)

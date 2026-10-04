@@ -111,14 +111,21 @@ class TelethonBackend:
         return target
 
     @staticmethod
-    def _scrub(iterator):
+    def _scrub_dialog(item):
+        if item is None:
+            return
+        item.message = None
+        item.draft = None
+        if hasattr(item.dialog, 'draft'):
+            item.dialog.draft = None
+
+    @classmethod
+    def _scrub(cls, iterator, current=None):
         # SDK Dialog objects contain last-message/draft text. Offsets have
         # already been calculated; retain metadata/entities, never these texts.
+        cls._scrub_dialog(current)
         for item in iterator.buffer or ():
-            item.message = None
-            item.draft = None
-            if hasattr(item.dialog, 'draft'):
-                item.dialog.draft = None
+            cls._scrub_dialog(item)
 
     async def dialog_page(self, state, limit):
         from telethon.utils import get_peer_id
@@ -131,6 +138,7 @@ class TelethonBackend:
         # Limit consumed raw entries too. Excluded broadcast/unknown records
         # cannot trigger an unbounded fill-the-page loop.
         for _ in range(limit):
+            dialog = None
             try:
                 dialog = await state.iterator.__anext__()
             except _PageBoundary:
@@ -141,17 +149,34 @@ class TelethonBackend:
                 break
             finally:
                 self._scrub(state.iterator)
-            entity = dialog.entity
-            kind = self.kind(entity)
-            target = get_peer_id(entity)
-            if (kind not in {'user','group'} and not self._is_allowed_broadcast(target, entity)) or (
-                    state.archived is not None and bool(dialog.archived) != state.archived):
-                continue
-            target = self._remember(entity)
-            title = getattr(entity, "title", None) or " ".join(
-                x for x in (getattr(entity, "first_name", None), getattr(entity, "last_name", None)) if x)
-            rows.append({"peer_id": target, "type": kind, "title": title,
-                         "archived": bool(dialog.archived), "unread": dialog.unread_count or 0})
+            try:
+                entity = dialog.entity
+                kind = self.kind(entity)
+                target = get_peer_id(entity)
+                if ((kind not in {'user','group'} and not self._is_allowed_broadcast(target, entity)) or
+                        (state.archived is not None and bool(dialog.archived) != state.archived)):
+                    continue
+                target = self._remember(entity)
+                title = getattr(entity, "title", None) or " ".join(
+                    x for x in (getattr(entity, "first_name", None), getattr(entity, "last_name", None)) if x)
+                message = getattr(dialog, "message", None)
+                message_id = getattr(message, "id", None)
+                if type(message_id) is not int:
+                    message_id = getattr(dialog.dialog, "top_message", None)
+                if type(message_id) is not int or not 0 <= message_id < 2**31:
+                    message_id = None
+                read_inbox_max_id = getattr(dialog.dialog, "read_inbox_max_id", None)
+                if type(read_inbox_max_id) is not int or not 0 <= read_inbox_max_id < 2**31:
+                    read_inbox_max_id = 0
+                latest_date = getattr(dialog, "date", None)
+                latest_date = latest_date.isoformat() if callable(getattr(latest_date, "isoformat", None)) else None
+                rows.append({"peer_id": target, "type": kind, "title": title,
+                             "archived": bool(dialog.archived), "unread": dialog.unread_count or 0,
+                             "latest_message_id": message_id,
+                             "latest_message_date": latest_date,
+                             "read_inbox_max_id": read_inbox_max_id})
+            finally:
+                self._scrub_dialog(dialog)
         if state.iterator.left <= 0:
             state.exhausted = True
         state.truncated |= state.budget.truncated
@@ -238,6 +263,7 @@ class TelethonBackend:
         return {"id": message.id, "text": getattr(message, "message", "") or "",
                 "date": message.date.isoformat() if message.date else None,
                 "sender_id": message.sender_id, "has_media": message.media is not None,
+                "out": bool(getattr(message, "out", False)),
                 "reply_to": getattr(reply, "reply_to_msg_id", None),
                 "reply_peer_id": get_peer_id(reply_peer) if reply_peer else None}
 
@@ -248,6 +274,16 @@ class TelethonBackend:
             kwargs["search"] = query
         result = await self.client.get_messages(self.peers[target], **kwargs)
         return [self.record(m) for m in result if m is not None]
+
+    async def new_messages(self, target, *, after_id, through_id, limit):
+        """Fetch a bounded oldest-first page inside a fixed message-ID range."""
+        await self.activate()
+        result = await self.client.get_messages(
+            self.peers[target], limit=limit + 1, min_id=after_id,
+            max_id=through_id + 1, reverse=True)
+        messages = [self.record(m) for m in result if m is not None]
+        messages = [m for m in messages if after_id < m["id"] <= through_id]
+        return sorted(messages, key=lambda message: message["id"])
 
     async def message(self, target, message_id):
         await self.activate()

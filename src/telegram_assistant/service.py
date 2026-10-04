@@ -70,7 +70,7 @@ class Service:
         if "telegram:read" not in SCOPES.get():
             return {"error": "unauthorized"}
         if operation not in {"list_dialogs", "get_history", "search_messages", "get_reply_context",
-                             "view_photo", "transcribe_audio", "send_message", "send_media"}:
+                             "scan_updates", "view_photo", "transcribe_audio", "send_message", "send_media"}:
             return {"error": "unknown_tool"}
         async with self.lock:
             try:
@@ -212,7 +212,8 @@ class Service:
             raise Denied("peer_mismatch")
         return (target, resolved[1]) if return_type else target
 
-    async def list_dialogs(self, archived=None, limit=20, cursor=None):
+    async def list_dialogs(self, archived=None, limit=20, cursor=None, *,
+                           _monitor_metadata=False, _fresh=False):
         integer(limit, 1, 50)
         if archived is not None and type(archived) is not bool:
             raise Denied("invalid_argument")
@@ -229,8 +230,8 @@ class Service:
         else:
             # Reuse the cached prefix across chats instead of restarting a
             # Telegram catalogue scan on each initial request.
-            snap = next((key for key, value in reversed(self.snapshots.items())
-                         if value['archived'] == archived), None)
+            snap = None if _fresh else next((key for key, value in reversed(self.snapshots.items())
+                                             if value['archived'] == archived), None)
             if snap is None:
                 snap = secrets.token_urlsafe(24)
                 self.snapshots[snap] = {'expires': now + 300, 'archived': archived,
@@ -254,11 +255,18 @@ class Service:
                 title, truncated = clip(d["title"])
                 rows.append({"peer_id": d["peer_id"], "title": title, "title_truncated": truncated,
                              "type": "channel" if is_owner_broadcast else d["type"],
-                             "archived": d["archived"], "unread": d["unread"]})
+                             "archived": d["archived"], "unread": d["unread"],
+                             "latest_message_id": d.get("latest_message_id"),
+                             "latest_message_date": d.get("latest_message_date"),
+                             "read_inbox_max_id": d.get("read_inbox_max_id", 0)})
             listing['blocks'].append({'rows': rows, 'done': result['done'], 'truncated': result['truncated']})
         block = listing['blocks'][block_index]
         rows = block['rows']
         page = rows[start:start + limit]
+        if not _monitor_metadata:
+            page = [{key: row[key] for key in
+                     ("peer_id", "title", "title_truncated", "type", "archived", "unread")}
+                    for row in page]
         payload = {"dialogs": page, "next_cursor": None, "snapshot_expires_at": listing['expires'],
                    "listing_complete": False, "scan_truncated": block['truncated'],
                    "pagination_consistency": "cached_pages_stable_unfetched_live", "untrusted_content": True}
@@ -275,6 +283,148 @@ class Service:
         payload['listing_complete'] = payload['next_cursor'] is None and block['done'] and not block['truncated']
         return payload
 
+    def _monitor_output(self, messages, delivery, state, pending_count):
+        limited_dialogs = self.quotas.monitor_initial_window_limited_count()
+        return {"messages": messages, "next_cursor": delivery["out_cursor"],
+                "catalogue_complete": state["catalog_complete"],
+                "scan_truncated": state["catalog_truncated"],
+                "coverage_restarted": state["coverage_restarted"],
+                "queued_peers": pending_count,
+                "initial_window_messages": self.quotas.MONITOR_FIRST_DM_WINDOW_MESSAGES,
+                "initial_window_limited_dialogs": limited_dialogs,
+                "initial_history_incomplete": limited_dialogs > 0,
+                "coverage_complete": (state["catalog_finished"] and state["catalog_complete"] and
+                                      pending_count == 0),
+                "untrusted_content": True,
+                "continuation": "pass next_cursor to acknowledge this page; reuse the same input cursor to replay it"}
+
+    async def _monitor_records(self, delivery):
+        if delivery["peer"] is None:
+            return []
+        target, peer_type = await self._resolve(delivery["peer"], return_type=True)
+        if peer_type not in {"user", "group"}:
+            raise Denied("peer_mismatch")
+        fetch = getattr(self.backend, "new_messages", None)
+        if fetch is None:
+            raise Denied("monitor_unavailable")
+        rows = await fetch(target, after_id=delivery["after_id"],
+                           through_id=delivery["through_id"], limit=delivery["limit"])
+        return [self._record(row, target) for row in rows[:delivery["limit"]]]
+
+    async def scan_updates(self, limit=5, cursor=None):
+        """Incrementally scan a bounded dialog page and deliver one peer's new messages."""
+        integer(limit, 1, 10)
+        if cursor is not None and (not isinstance(cursor, str) or not 1 <= len(cursor) <= 128):
+            raise Denied("invalid_cursor")
+        if self.quotas is None:
+            raise Denied("monitor_state_unavailable")
+        state = self.quotas.load_monitor_state()
+        delivery = state["inflight"]
+        if delivery is not None:
+            if cursor == delivery["in_cursor"]:
+                messages = await self._monitor_records(delivery)
+                payload = self._monitor_output(
+                    messages, delivery, state, self.quotas.monitor_pending_count())
+                while wire_size(payload) > MAX_BYTES and messages:
+                    messages.pop()
+                    if messages:
+                        delivery["limit"] = len(messages)
+                        delivery["ack_id"] = messages[-1]["message_id"]
+                        delivery["has_more"] = True
+                        state["inflight"] = delivery
+                        self.quotas.save_monitor_state(state)
+                    payload = self._monitor_output(
+                        messages, delivery, state, self.quotas.monitor_pending_count())
+                return bounded(payload)
+            if cursor != delivery["out_cursor"]:
+                raise Denied("invalid_cursor")
+            state = self.quotas.acknowledge_monitor_page(state, delivery)
+        elif cursor != state["last_acked_cursor"]:
+            raise Denied("invalid_cursor")
+
+        # Once one sweep has discovered a backlog, drain that durable queue
+        # before starting another catalogue sweep. This avoids one catalogue
+        # RPC on every message page during high-volume catch-up.
+        skip_catalogue = state["catalog_finished"] and self.quotas.monitor_pending_count() > 0
+        if not skip_catalogue:
+            fresh = not state["sweep_started"]
+            if state["catalog_finished"]:
+                state.update({"catalog_cursor": None, "catalog_finished": False,
+                              "catalog_complete": False, "catalog_truncated": False,
+                              "coverage_restarted": False, "sweep_started": True})
+                fresh = True
+                self.quotas.save_monitor_state(state)
+            elif fresh:
+                state["sweep_started"] = True
+                self.quotas.save_monitor_state(state)
+
+            try:
+                listing = await self.list_dialogs(
+                    archived=None, limit=50, cursor=state["catalog_cursor"],
+                    _monitor_metadata=True, _fresh=fresh)
+            except Denied as exc:
+                if (state["catalog_cursor"] is None or
+                        exc.code not in {"invalid_cursor", "cursor_expired_or_mismatched"}):
+                    raise
+                # The catalogue cursor is deliberately ephemeral (five minute
+                # cache). Durable per-peer watermarks survive; restart the sweep.
+                state.update({"catalog_cursor": None, "catalog_finished": False,
+                              "catalog_complete": False, "catalog_truncated": False,
+                              "coverage_restarted": True, "sweep_started": True})
+                self.quotas.save_monitor_state(state)
+                listing = await self.list_dialogs(archived=None, limit=50, cursor=None,
+                                                  _monitor_metadata=True, _fresh=True)
+
+            self.quotas.observe_monitor_dialogs(listing["dialogs"])
+            state["catalog_cursor"] = listing["next_cursor"]
+            state["catalog_finished"] = listing["next_cursor"] is None
+            state["catalog_complete"] = bool(listing["listing_complete"])
+            state["catalog_truncated"] = state["catalog_truncated"] or bool(listing["scan_truncated"])
+            self.quotas.save_monitor_state(state)
+
+        pending = self.quotas.next_monitor_pending()
+        messages = []
+        peer = after_id = through_id = ack_id = None
+        has_more = False
+        if pending is not None:
+            peer = pending["peer_id"]
+            after_id, through_id = pending["after_id"], pending["through_id"]
+            target, peer_type = await self._resolve(peer, return_type=True)
+            if peer_type != pending["peer_type"]:
+                raise Denied("peer_mismatch")
+            fetch = getattr(self.backend, "new_messages", None)
+            if fetch is None:
+                raise Denied("monitor_unavailable")
+            fetched = await fetch(target, after_id=after_id, through_id=through_id, limit=limit)
+            page = list(fetched[:limit])
+            has_more = len(fetched) > len(page)
+
+        delivery = {"in_cursor": cursor, "out_cursor": secrets.token_urlsafe(24),
+                    "peer": peer, "after_id": after_id, "through_id": through_id,
+                    "limit": max(1, len(page)) if pending is not None and page else limit,
+                    "ack_id": ack_id, "has_more": has_more}
+        while True:
+            messages = [self._record(row, target) for row in page] if pending is not None else []
+            if pending is not None and page:
+                delivery["limit"] = len(page)
+                delivery["has_more"] = has_more
+                delivery["ack_id"] = page[-1]["id"] if has_more else through_id
+            elif pending is not None:
+                # A successful empty fetch covers the requested ID range. It
+                # remains uncommitted until the caller presents this cursor.
+                delivery["ack_id"] = through_id
+            payload = self._monitor_output(
+                messages, delivery, state, self.quotas.monitor_pending_count())
+            if wire_size(payload) <= MAX_BYTES:
+                break
+            if pending is None or not page:
+                raise Denied("monitor_response_too_large")
+            page.pop()
+            has_more = True
+        state["inflight"] = delivery
+        self.quotas.save_monitor_state(state)
+        return bounded(payload)
+
     @staticmethod
     def _record(message, target):
         text, truncated = clip(message["text"], 2000)
@@ -282,7 +432,7 @@ class Service:
         return {"peer_id": target, "message_id": message["id"], "sender_id": sender,
                 "date": message.get("date"), "text": text, "text_truncated": truncated,
                 "has_media": bool(message.get("has_media")), "reply_to": message.get("reply_to"),
-                "reply_peer_id": message.get("reply_peer_id")}
+                "reply_peer_id": message.get("reply_peer_id"), "out": bool(message.get("out", False))}
 
     async def _messages(self, target, limit, before_id, query=None):
         integer(limit, 1, 50)

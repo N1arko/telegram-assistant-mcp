@@ -119,6 +119,49 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await service.invoke('search_messages',peer_id=42,query='fake',limit=1))['messages'],[])
         self.client.get_messages.assert_awaited_once_with(self.backend.peers[42],limit=2,offset_id=0,search='fake')
         self.assertEqual(len(self.client.requests),1)
+
+    async def test_incremental_catalogue_metadata_is_private_to_monitor_path(self):
+        page=response([42],terminal=True,count=1)
+        page.dialogs[0].read_inbox_max_id=7
+        service=self.service([page])
+        internal=await service.list_dialogs(limit=50,_monitor_metadata=True,_fresh=True)
+        row=internal["dialogs"][0]
+        self.assertEqual(row["latest_message_id"],42)
+        self.assertEqual(row["read_inbox_max_id"],7)
+        public=await service.list_dialogs(limit=1)
+        self.assertEqual(set(public["dialogs"][0]),
+                         {"peer_id","title","title_truncated","type","archived","unread"})
+
+    async def test_scan_updates_unchanged_1000_dialog_catalogue_uses_catalogue_only(self):
+        """A full unchanged pass costs 20 GetDialogs RPCs and zero history RPCs."""
+        pages = []
+        for start in range(1, 1001, 50):
+            ids = range(start, min(start + 50, 1001))
+            pages.append(response(ids, count=1000, terminal=(start == 951)))
+        client = OfflineClient(pages)
+        backend = TelethonBackend(client)
+        backend.new_messages = AsyncMock(side_effect=AssertionError("unexpected history RPC"))
+        self.backend, self.client = backend, client
+        with tempfile.TemporaryDirectory() as tmp:
+            quotas = Quotas(Path(tmp) / "runtime" / "quotas.sqlite")
+            try:
+                quotas.db.executemany(
+                    "INSERT INTO monitor_checkpoints(peer,message_id,peer_type) VALUES(?,?,?)",
+                    ((i, i, "user") for i in range(1, 1001)))
+                quotas.db.commit()
+                service = Service(backend, quotas=quotas, gate=RateGate(limit=1000))
+                cursor = None
+                for _ in range(20):
+                    result = await service.invoke("scan_updates", limit=5, cursor=cursor)
+                    self.assertEqual(result["messages"], [])
+                    cursor = result["next_cursor"]
+                self.assertTrue(result["catalogue_complete"])
+                self.assertEqual(len(client.requests), 20)
+                self.assertTrue(all(request.limit == 50 for request in client.requests))
+                backend.new_messages.assert_not_awaited()
+            finally:
+                quotas.close()
+
     async def test_archive_is_telegram_folder_filter(self):
         for archived,folder in [(None,None),(True,1),(False,0)]:
             with self.subTest(archived=archived):

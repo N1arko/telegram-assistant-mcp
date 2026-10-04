@@ -29,7 +29,7 @@ This guide describes how to run a local, read-only MCP for personal Telegram cha
 
 ## What the server does
 
-In `--read-only` mode, the server exposes six tools: list dialogs, read a selected dialog’s history, search within it, get reply context, view one explicitly requested photo, and optionally transcribe one explicitly requested audio attachment. Each request is checked against an OAuth access token and is bounded by size and rate. Treat Telegram content as untrusted data.
+In `--read-only` mode, the server exposes seven tools: list dialogs, incrementally scan updates, read a selected dialog’s history, search within it, get reply context, view one explicitly requested photo, and optionally transcribe one explicitly requested audio attachment. Each request is checked against an OAuth access token and is bounded by size and rate. Treat Telegram content as untrusted data.
 
 The code also contains `send_message` and `send_media` paths when read-only mode is disabled and a permission plus recipient grant are configured. This guide does not enable them, and real Telegram delivery has not been verified. Do not activate sending for the read-only setup described here. See [server.py](../src/telegram_assistant/server.py), [security.py](../src/telegram_assistant/security.py), and the [service tests](../tests/test_service.py) for implementation details. The local operator controls are described in the [send policy guide](SENDING-POLICY.en.md).
 
@@ -49,6 +49,16 @@ To enable it, make a private API-key file using your secret manager or another h
     --transcription-key-file /run/assistant/openai_api_key
 
 `--transcription-monthly-seconds` optionally sets a UTC calendar-month cap in audio seconds, persisted in the existing quota database. Its default `0` disables the local monthly cap. If enabled, a reservation is kept even if the provider fails, preventing retries from exceeding that cap. `--transcription-max-duration-seconds` can lower the five-minute per-file maximum. The local seconds cap is separate from any OpenAI project or organization spending limit; audio seconds do not equal a dollar-denominated bill cap. Before enabling, decide which messages may be sent to OpenAI and provision the key safely. Do not use real audio for local compatibility tests.
+
+## Incremental updates
+
+`scan_updates(limit=5, cursor=null)` is an explicit read-only poll for new text/captions across personal chats and groups, including archived and pinned dialogs. Each call scans at most one catalogue page of 50 dialogs and returns at most one oldest-first message page from one peer (1–10 messages). Large text responses are trimmed to the existing 48 KiB response budget, with continuation left at the last returned message. During catch-up, it drains the discovered queue before starting another catalogue sweep, reducing catalogue RPCs. An uncached or stale peer may add one targeted membership-check RPC to a call. It never calls Telegram's mark-as-read operation and never downloads media; attachments are represented only by `has_media`.
+
+On first discovery, a direct chat checks at most the last 20 message IDs, regardless of Telegram's read watermark. This can include already-read messages that may still need a reply. The range is delivered in pages of up to 10 messages. Older history is not fetched. If the starting ID is above zero, `initial_history_incomplete` is true and `initial_window_limited_dialogs` reports how many direct chats were cut off; the flag is durable across restarts. The scan cannot determine which message is unanswered, so older unanswered requests may remain outside this window. A group starts at its current latest message ID to avoid unexpectedly exporting old group history. Later scans use durable per-peer message-ID checkpoints; unread counts are not used as the sole filter. New senders are found when their dialogs appear in the catalogue. Both incoming and outgoing messages are included, with `out` identifying messages sent by the account.
+
+Always pass the returned `next_cursor` to the next call, including after an empty page. Presenting it acknowledges the previous page; repeating the same input cursor replays that page. Delivery is at-least-once, so downstream consumers should deduplicate by `(peer_id, message_id)`. Continue sequentially: a busy peer is moved behind other queued dialogs between pages. When Telegram returns `telegram_rate_limited`, wait for `retry_after_seconds` and retry with the same input cursor. A failed call does not acknowledge the page.
+
+Inspect `catalogue_complete`, `coverage_complete`, `initial_history_incomplete`, `scan_truncated`, and `coverage_restarted` in every response. `coverage_complete` means a full current catalogue sweep finished and its discovered message queue drained; it does not claim full historical coverage. The initial DM window and group starting point deliberately omit older history. Later arrivals are picked up on the next sweep. The existing 5,000-dialog scan cap sets `scan_truncated` and leaves current coverage incomplete. Catalogue cursors are process-memory snapshots with a five-minute lifetime; after expiry or restart, the scan restarts catalogue discovery, retains message-ID checkpoints and queued ranges, and sets `coverage_restarted`. A restarted sweep must finish before current coverage can be complete. The tool is caller-driven; no background polling is started by the server.
 
 ## 1. Install the project and run tests
 
@@ -157,7 +167,7 @@ Before deployment, pin a reviewed base image digest, review dependencies, and co
 
 ## 7. First call and cooldown
 
-After startup, wait at least 60 seconds for the startup grace period; a saved cooldown may be longer. After connecting OAuth, first request one row from the dialog catalog, for example `list_dialogs(limit=1)`. Pagination returns a cursor for the next bounded page; do not request pages in parallel. If you receive `telegram_rate_limited` or `retry_after_seconds`, stop and wait for the specified period. Do not retry in a loop or start a new login because of a rate limit.
+After startup, wait at least 60 seconds for the startup grace period; a saved cooldown may be longer. After connecting OAuth, first request one row from the dialog catalog, for example `list_dialogs(limit=1)`. For ongoing monitoring, use `scan_updates` and continue with its `next_cursor`; do not request pages in parallel. If you receive `telegram_rate_limited` or `retry_after_seconds`, stop and wait for the specified period, then retry with the same input cursor. Do not retry in a loop or start a new login because of a rate limit.
 
 Errors are separated by layer:
 

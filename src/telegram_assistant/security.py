@@ -308,6 +308,8 @@ class Policy:
 
 class Quotas:
     """Reserve before RPC, including failures; SQLite survives restarts."""
+    MONITOR_FIRST_DM_WINDOW_MESSAGES = 20
+
     def __init__(self, path: Path):
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if path.parent.is_symlink() or path.parent.stat().st_mode & 0o077:
@@ -326,6 +328,14 @@ class Quotas:
         self.db.execute("CREATE TABLE IF NOT EXISTS first_contact_attempts (peer INTEGER, message_id INTEGER, at REAL, state TEXT, PRIMARY KEY(peer,message_id))")
         self.db.execute("CREATE TABLE IF NOT EXISTS read_gate (id INTEGER PRIMARY KEY CHECK(id=1), state TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS transcription_usage (month TEXT PRIMARY KEY, seconds INTEGER NOT NULL)")
+        # The incremental reader persists only peer/message IDs and opaque
+        # cursors. Message text and media are never stored in this database.
+        self.db.execute("CREATE TABLE IF NOT EXISTS monitor_checkpoints (peer INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, peer_type TEXT NOT NULL, initial_window_limited INTEGER NOT NULL DEFAULT 0)")
+        checkpoint_columns = {row[1] for row in self.db.execute("PRAGMA table_info(monitor_checkpoints)")}
+        if "initial_window_limited" not in checkpoint_columns:
+            self.db.execute("ALTER TABLE monitor_checkpoints ADD COLUMN initial_window_limited INTEGER NOT NULL DEFAULT 0")
+        self.db.execute("CREATE TABLE IF NOT EXISTS monitor_pending (sequence INTEGER PRIMARY KEY AUTOINCREMENT, peer INTEGER NOT NULL UNIQUE, after_id INTEGER NOT NULL, through_id INTEGER NOT NULL, peer_type TEXT NOT NULL)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS monitor_state (id INTEGER PRIMARY KEY CHECK(id=1), state TEXT NOT NULL)")
         self.db.commit()
 
     def load_gate(self):
@@ -395,6 +405,196 @@ class Quotas:
             self.db.execute("INSERT OR REPLACE INTO transcription_usage VALUES(?, ?)",
                             (month, used + seconds))
             self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    @staticmethod
+    def _default_monitor_state():
+        return {"version": 1, "catalog_cursor": None, "catalog_finished": False,
+                "catalog_complete": False, "catalog_truncated": False,
+                "coverage_restarted": False, "sweep_started": False,
+                "last_acked_cursor": None, "inflight": None}
+
+    @classmethod
+    def _validate_monitor_state(cls, state):
+        fields = {"version", "catalog_cursor", "catalog_finished", "catalog_complete",
+                  "catalog_truncated", "coverage_restarted", "sweep_started",
+                  "last_acked_cursor", "inflight"}
+        if (not isinstance(state, dict) or set(state) != fields or
+                type(state.get("version")) is not int or state["version"] != 1):
+            raise Denied("monitor_state_unavailable")
+        for name in ("catalog_finished", "catalog_complete", "catalog_truncated",
+                     "coverage_restarted", "sweep_started"):
+            if type(state[name]) is not bool:
+                raise Denied("monitor_state_unavailable")
+        for name in ("catalog_cursor", "last_acked_cursor"):
+            value = state[name]
+            if value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 128):
+                raise Denied("monitor_state_unavailable")
+        delivery = state["inflight"]
+        if delivery is not None:
+            delivery_fields = {"in_cursor", "out_cursor", "peer", "after_id", "through_id",
+                               "limit", "ack_id", "has_more"}
+            if not isinstance(delivery, dict) or set(delivery) != delivery_fields:
+                raise Denied("monitor_state_unavailable")
+            for name in ("in_cursor", "out_cursor"):
+                value = delivery[name]
+                if value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 128):
+                    raise Denied("monitor_state_unavailable")
+            peer = delivery["peer"]
+            if peer is not None and (type(peer) is not int or not -(2**53) <= peer <= 2**53):
+                raise Denied("monitor_state_unavailable")
+            for name in ("after_id", "through_id", "ack_id"):
+                value = delivery[name]
+                if value is not None and (type(value) is not int or not 0 <= value < 2**31):
+                    raise Denied("monitor_state_unavailable")
+            if type(delivery["limit"]) is not int or not 1 <= delivery["limit"] <= 10:
+                raise Denied("monitor_state_unavailable")
+            if type(delivery["has_more"]) is not bool:
+                raise Denied("monitor_state_unavailable")
+            if delivery["peer"] is None and any(delivery[k] is not None for k in
+                    ("after_id", "through_id", "ack_id")):
+                raise Denied("monitor_state_unavailable")
+            if delivery["peer"] is not None and any(delivery[k] is None for k in
+                    ("after_id", "through_id", "ack_id")):
+                raise Denied("monitor_state_unavailable")
+        try:
+            encoded = json.dumps(state, ensure_ascii=True, allow_nan=False,
+                                 separators=(",", ":"))
+        except (TypeError, ValueError):
+            raise Denied("monitor_state_unavailable") from None
+        if len(encoded) > 16_384:
+            raise Denied("monitor_state_unavailable")
+        return state
+
+    def load_monitor_state(self):
+        row = self.db.execute("SELECT state FROM monitor_state WHERE id=1").fetchone()
+        if row is None:
+            return self._default_monitor_state()
+        try:
+            state = json.loads(row[0])
+            return self._validate_monitor_state(state)
+        except (TypeError, ValueError, json.JSONDecodeError, Denied):
+            raise Denied("monitor_state_unavailable") from None
+
+    def save_monitor_state(self, state):
+        state = self._validate_monitor_state(state)
+        encoded = json.dumps(state, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+        self.db.execute("INSERT OR REPLACE INTO monitor_state VALUES(1, ?)", (encoded,))
+        self.db.commit()
+
+    def observe_monitor_dialogs(self, rows):
+        """Persist bounded catalogue observations and enqueue unseen message ranges."""
+        if not isinstance(rows, (list, tuple)) or len(rows) > 50:
+            raise Denied("monitor_state_unavailable")
+        parsed = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise Denied("monitor_state_unavailable")
+            peer, peer_type = row.get("peer_id"), row.get("type")
+            latest = row.get("latest_message_id")
+            if (type(peer) is not int or not -(2**53) <= peer <= 2**53 or
+                    not isinstance(peer_type, str) or peer_type not in {"user", "group"}):
+                continue
+            latest = latest if type(latest) is int and 0 <= latest < 2**31 else 0
+            parsed.append((peer, peer_type, latest))
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for peer, peer_type, latest in parsed:
+                checkpoint = self.db.execute(
+                    "SELECT message_id FROM monitor_checkpoints WHERE peer=?", (peer,)).fetchone()
+                if checkpoint is None:
+                    # An empty dialog needs no checkpoint yet. If it becomes
+                    # active before the next catalogue pass, bootstrap it then
+                    # rather than treating its whole accumulated history as new.
+                    if latest == 0:
+                        continue
+                    if peer_type == "user":
+                        # Include a small recent window irrespective of Telegram's
+                        # read watermark: read messages can still be unanswered.
+                        baseline = max(0, latest - self.MONITOR_FIRST_DM_WINDOW_MESSAGES)
+                        limited = int(baseline > 0)
+                    else:
+                        # Avoid exporting an old group backlog on first sight.
+                        baseline, limited = latest, 0
+                    self.db.execute(
+                        "INSERT INTO monitor_checkpoints(peer,message_id,peer_type,initial_window_limited) VALUES(?,?,?,?)",
+                        (peer, baseline, peer_type, limited))
+                    checkpoint_id = baseline
+                else:
+                    checkpoint_id = checkpoint[0]
+                if latest <= checkpoint_id:
+                    continue
+                pending = self.db.execute(
+                    "SELECT sequence,after_id,through_id FROM monitor_pending WHERE peer=?", (peer,)).fetchone()
+                if pending is None:
+                    self.db.execute(
+                        "INSERT INTO monitor_pending(peer,after_id,through_id,peer_type) VALUES(?,?,?,?)",
+                        (peer, checkpoint_id, latest, peer_type))
+                else:
+                    self.db.execute("UPDATE monitor_pending SET through_id=MAX(through_id,?) WHERE peer=?",
+                                    (latest, peer))
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
+
+    def next_monitor_pending(self):
+        row = self.db.execute(
+            "SELECT peer,after_id,through_id,peer_type FROM monitor_pending ORDER BY sequence LIMIT 1").fetchone()
+        return (None if row is None else
+                {"peer_id": row[0], "after_id": row[1], "through_id": row[2], "peer_type": row[3]})
+
+    def monitor_pending_count(self):
+        return self.db.execute("SELECT count(*) FROM monitor_pending").fetchone()[0]
+
+    def monitor_initial_window_limited_count(self):
+        return self.db.execute(
+            "SELECT count(*) FROM monitor_checkpoints WHERE initial_window_limited=1").fetchone()[0]
+
+    def acknowledge_monitor_page(self, state, delivery):
+        """Commit one delivered page only when its returned cursor is presented."""
+        state = self._validate_monitor_state(state)
+        if (state.get("inflight") != delivery or delivery is None or
+                not isinstance(delivery.get("out_cursor"), str)):
+            raise Denied("invalid_cursor")
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            stored = self.db.execute("SELECT state FROM monitor_state WHERE id=1").fetchone()
+            current = self._default_monitor_state() if stored is None else self._validate_monitor_state(
+                json.loads(stored[0]))
+            if current.get("inflight") != delivery:
+                raise Denied("invalid_cursor")
+            peer, ack_id = delivery["peer"], delivery["ack_id"]
+            if peer is not None:
+                checkpoint = self.db.execute(
+                    "SELECT message_id,peer_type FROM monitor_checkpoints WHERE peer=?", (peer,)).fetchone()
+                previous = checkpoint[0] if checkpoint else 0
+                pending = self.db.execute(
+                    "SELECT sequence,after_id,through_id,peer_type FROM monitor_pending WHERE peer=?",
+                    (peer,)).fetchone()
+                peer_type = checkpoint[1] if checkpoint else (pending[3] if pending else "user")
+                self.db.execute(
+                    "INSERT INTO monitor_checkpoints(peer,message_id,peer_type) VALUES(?,?,?) "
+                    "ON CONFLICT(peer) DO UPDATE SET message_id=MAX(monitor_checkpoints.message_id,excluded.message_id), "
+                    "peer_type=excluded.peer_type",
+                    (peer, max(previous, ack_id), peer_type))
+                if pending is not None:
+                    _, current_after, current_through, peer_type = pending
+                    if delivery["has_more"] or current_through > delivery["through_id"]:
+                        sequence = self.db.execute(
+                            "SELECT COALESCE(MAX(sequence),0)+1 FROM monitor_pending").fetchone()[0]
+                        self.db.execute("UPDATE monitor_pending SET after_id=?,sequence=? WHERE peer=?",
+                                        (max(current_after, ack_id), sequence, peer))
+                    else:
+                        self.db.execute("DELETE FROM monitor_pending WHERE peer=?", (peer,))
+            current["inflight"] = None
+            current["last_acked_cursor"] = delivery["out_cursor"]
+            encoded = json.dumps(current, ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+            self.db.execute("INSERT OR REPLACE INTO monitor_state VALUES(1,?)", (encoded,))
+            self.db.commit()
+            return current
         except BaseException:
             self.db.rollback()
             raise
