@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
+from .auth_diagnostics import mark_auth_reason
 from .security import Denied, private_file
 
 
@@ -88,6 +89,7 @@ class JWKSVerifier:
         self.config, self.clock, self.monotonic = config, clock, monotonic
         self.cache_seconds, self.refresh_seconds = cache_seconds, refresh_seconds
         self.keys, self.expires, self.retry_after = {}, 0, 0
+        self.retry_reason = "jwks"
         self.lock = asyncio.Lock()
         self.http = http or httpx.AsyncClient(timeout=5, follow_redirects=False, trust_env=False,
                         limits=httpx.Limits(max_connections=4, max_keepalive_connections=2))
@@ -96,48 +98,51 @@ class JWKSVerifier:
         async with self.lock:
             now = self.monotonic()
             if now < self.expires and kid in self.keys:
-                return self.keys[kid]
+                return self.keys[kid], None
             if now < self.retry_after:
-                return None
+                return None, self.retry_reason
             self.retry_after = now + self.refresh_seconds
+            self.retry_reason = "jwks"
             try:
                 import jwt
                 async with self.http.stream("GET", self.config.jwks_url,
                         headers={"Accept": "application/json"}) as response:
                     if response.status_code != 200:
-                        return None
+                        return None, "jwks"
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
                         body.extend(chunk)
                         if len(body) > 65536:
-                            return None
+                            return None, "jwks"
                 document = json.loads(body)
                 entries = document.get("keys") if isinstance(document, dict) else None
                 if not isinstance(entries, list) or not 1 <= len(entries) <= 16:
-                    return None
+                    return None, "jwks"
                 keys = {}
                 for entry in entries:
                     if not isinstance(entry, dict):
-                        return None
+                        return None, "jwks"
                     ident = entry.get("kid")
                     if not isinstance(ident, str) or not 1 <= len(ident) <= 256 or ident in keys:
-                        return None
+                        return None, "jwks"
                     if (entry.get("kty") != "RSA" or entry.get("use", "sig") != "sig" or
                             entry.get("alg", "RS256") != "RS256" or
                             entry.get("key_ops", ["verify"]) != ["verify"] or "d" in entry):
-                        return None
+                        return None, "jwks"
                     key = jwt.algorithms.RSAAlgorithm.from_jwk(entry)
                     if key.key_size < 2048:
-                        return None
+                        return None, "jwks"
                     keys[ident] = key
                 self.keys, self.expires = keys, self.monotonic() + self.cache_seconds
-                return keys.get(kid)
+                self.retry_reason = "claims"
+                return keys.get(kid), "claims" if kid not in keys else None
             except Exception:
-                return None
+                return None, "jwks"
 
     async def verify_token(self, token):
         from mcp.server.auth.provider import AccessToken
         if not isinstance(token, str) or not 1 <= len(token) <= 8192:
+            mark_auth_reason("claims")
             return None
         try:
             import jwt
@@ -146,20 +151,29 @@ class JWKSVerifier:
             if (header.get("alg") not in self.config.algorithms or
                     not isinstance(kid, str) or not 1 <= len(kid) <= 256 or
                     any(name in header for name in ("crit", "b64", "jku", "x5u", "jwk"))):
+                mark_auth_reason("claims")
                 return None
-            key = await self._key(kid)
+            key, key_failure = await self._key(kid)
             if key is None:
+                mark_auth_reason(key_failure)
                 return None
             data = jwt.decode(token, key, algorithms=list(self.config.algorithms),
                 options={"verify_exp": False, "verify_nbf": False, "verify_iat": False,
                          "verify_aud": False, "verify_iss": False})
-            result = validate_claims(data, self.config, self.clock())
+            now = self.clock()
+            if type(data.get("exp")) is int and data["exp"] <= now:
+                mark_auth_reason("expired")
+                return None
+            result = validate_claims(data, self.config, now)
             if result is None:
+                mark_auth_reason("claims")
                 return None
             client, scopes, expires = result
+            mark_auth_reason("other")  # Only used if a later middleware still returns 401.
             return AccessToken(token=token, client_id=client, scopes=sorted(scopes),
                                expires_at=expires, resource=self.config.resource)
         except Exception:
+            mark_auth_reason("claims")
             return None
 
     async def close(self):

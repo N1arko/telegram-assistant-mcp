@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -43,6 +44,7 @@ MediaItems = Annotated[list[OutboundMediaInput], Field(min_length=1, max_length=
 READ_ONLY_BROADCAST_CHANNEL = None
 
 from .auth import AuthConfig, JWKSVerifier, https_url
+from .auth_diagnostics import Auth401Diagnostics, Auth401Middleware
 from .security import Denied, private_file
 from .service import MAX_BYTES
 from .media import ImageResult, MAX_MEDIA_RESPONSE_BYTES, MAX_AUDIO_SECONDS, OpenAITranscriber, TranscriptionConfig
@@ -296,7 +298,7 @@ def build_mcp(service, config, verifier, *, read_only=False):
     return mcp
 
 
-def build_app(mcp, config, *, read_only=False):
+def build_app(mcp, config, *, read_only=False, diagnostics=None):
     from mcp.server.auth.routes import create_protected_resource_routes
     from pydantic import AnyHttpUrl
     app = mcp.streamable_http_app()
@@ -307,7 +309,8 @@ def build_app(mcp, config, *, read_only=False):
         scopes_supported=["telegram:read"] if read_only else ["telegram:read", "telegram:send"])
     paths = {r.path for r in metadata}
     app.routes[:] = [r for r in app.routes if getattr(r, "path", None) not in paths] + metadata
-    return RequestLimits(app)
+    limited = RequestLimits(app)
+    return Auth401Middleware(limited, diagnostics) if diagnostics is not None else limited
 
 
 @dataclass(frozen=True)
@@ -443,6 +446,9 @@ async def serve(args):
     args.runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     if args.runtime_dir.is_symlink() or args.runtime_dir.stat().st_mode & 0o077:
         raise Denied("unsafe_runtime")
+    diag_until = getattr(args, "auth_diagnostics_until_epoch", None)
+    diagnostics = (Auth401Diagnostics(args.runtime_dir / "auth-401.sqlite", diag_until)
+                   if diag_until is not None and diag_until > time.time() else None)
     quotas = Quotas(args.runtime_dir / "quotas.sqlite")
     lock = SessionLock("assistant", str(session.resolve()), lock_dir=args.runtime_dir / "locks")
     lock.acquire(grace_seconds=0)
@@ -501,7 +507,7 @@ async def serve(args):
             transcription=transcription, transcriber=transcriber)
         read_only = getattr(args, "read_only", False)
         mcp = build_mcp(service, auth, verifier, read_only=read_only)
-        app = build_app(mcp, auth, read_only=read_only)
+        app = build_app(mcp, auth, read_only=read_only, diagnostics=diagnostics)
         server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0" if args.container_network else "127.0.0.1", port=8876,
                       log_config=None, access_log=False, server_header=False, proxy_headers=False,
                       limit_concurrency=8, timeout_keep_alive=5, h11_max_incomplete_event_size=16384))
@@ -528,6 +534,8 @@ def main():
     parser.add_argument("--telegram-config", type=Path)
     parser.add_argument("--policy", type=Path)
     parser.add_argument("--runtime-dir", type=Path)
+    parser.add_argument("--auth-diagnostics-until-epoch", type=int,
+                        help="Temporary bounded /mcp 401 diagnostics cutoff (UTC Unix seconds)")
     parser.add_argument("--transcription-provider", choices=("off", "openai"), default="off",
                         help="External audio transcription provider (off by default)")
     parser.add_argument("--transcription-key-file", type=Path,
@@ -538,8 +546,10 @@ def main():
                         help="Per-file duration cap, from 1 through 300 seconds")
     args = parser.parse_args()
     if args.mode == "bootstrap":
-        if args.read_only or args.bootstrap_config is None or any((args.auth_config, args.telegram_config,
-                                                 args.policy, args.runtime_dir)) or args.transcription_provider != "off" or args.transcription_key_file:
+        if (args.read_only or args.bootstrap_config is None or
+                any((args.auth_config, args.telegram_config, args.policy, args.runtime_dir)) or
+                args.auth_diagnostics_until_epoch is not None or
+                args.transcription_provider != "off" or args.transcription_key_file):
             parser.error("bootstrap requires --bootstrap-config and forbids live configuration arguments")
     else:
         if args.bootstrap_config is not None or any(x is None for x in
@@ -551,6 +561,9 @@ def main():
             parser.error("--transcription-monthly-seconds must be in 0..2678400")
         if args.transcription_provider == "openai" and args.transcription_key_file is None:
             parser.error("--transcription-provider openai requires --transcription-key-file")
+        if (args.auth_diagnostics_until_epoch is not None and
+                args.auth_diagnostics_until_epoch > time.time() + 72 * 3600):
+            parser.error("--auth-diagnostics-until-epoch must be within 72 hours")
     try:
         asyncio.run(serve_bootstrap(args) if args.mode == "bootstrap" else serve(args))
     except KeyboardInterrupt:

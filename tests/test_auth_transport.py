@@ -1,13 +1,18 @@
 import json
 import asyncio
+import os
+import sqlite3
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 import httpx
 from telegram_assistant.auth import AuthConfig, JWKSVerifier, validate_claims
+from telegram_assistant.auth_diagnostics import Auth401Diagnostics
 from telegram_assistant.server import RequestLimits, build_app, build_mcp
 from telegram_assistant.service import MAX_BYTES, SCOPES, Service
 from telegram_assistant.media import ImageResult, MAX_MEDIA_RESPONSE_BYTES
@@ -165,6 +170,68 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("resource_metadata",response.headers["www-authenticate"])
         self.fake.history.assert_not_awaited()
         self.fake.send.assert_not_awaited()
+
+    async def test_401_diagnostics_are_anonymous_and_keep_oauth_challenge(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "auth-401.sqlite"
+            diagnostics = Auth401Diagnostics(path, int(time.time()) + 3600)
+            app = build_app(self.mcp, CONFIG, diagnostics=diagnostics)
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                         base_url="https://telegram.example.test") as client:
+                body = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+                expired = signed(claims(exp=int(time.time()) - 1))
+                wrong_audience = signed(claims(aud="https://wrong.test/mcp"))
+                for raw in (None, expired, wrong_audience):
+                    headers = {"Accept": "application/json, text/event-stream"}
+                    if raw is not None:
+                        headers["Authorization"] = f"Bearer {raw}"
+                    response = await client.post("/mcp", json=body, headers=headers)
+                    self.assertEqual(response.status_code, 401)
+                    self.assertIn("resource_metadata", response.headers["www-authenticate"])
+                    self.assertRegex(response.headers["x-mcp-diag-id"], r"^[0-9a-f]{16}$")
+                healthy = await client.post("/mcp", json=body, headers={
+                    "Accept": "application/json, text/event-stream",
+                    "Authorization": f"Bearer {signed()}"})
+                self.assertEqual(healthy.status_code, 200)
+                self.assertNotIn("x-mcp-diag-id", healthy.headers)
+            with sqlite3.connect(path) as db:
+                rows = db.execute("SELECT request_id, status, reason FROM auth_401 ORDER BY rowid").fetchall()
+            self.assertEqual([row[2] for row in rows], ["missing", "expired", "claims"])
+            self.assertTrue(all(row[1] == 401 for row in rows))
+            self.assertNotIn(expired.encode(), path.read_bytes())
+            self.assertNotIn(wrong_audience.encode(), path.read_bytes())
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    async def test_jwks_failure_is_distinct_from_invalid_claims(self):
+        with tempfile.TemporaryDirectory() as folder:
+            diagnostics = Auth401Diagnostics(Path(folder) / "auth-401.sqlite", int(time.time()) + 3600)
+            failing = JWKSVerifier(CONFIG, http=httpx.AsyncClient(transport=httpx.MockTransport(
+                lambda req: httpx.Response(503))))
+            mcp = build_mcp(self.service, CONFIG, failing)
+            app = build_app(mcp, CONFIG, diagnostics=diagnostics)
+            ready, stop = asyncio.Event(), asyncio.Event()
+            async def lifespan():
+                async with mcp.session_manager.run():
+                    ready.set()
+                    await stop.wait()
+            task = asyncio.create_task(lifespan())
+            await ready.wait()
+            try:
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                             base_url="https://telegram.example.test") as client:
+                    response = await client.post("/mcp", json={"jsonrpc": "2.0", "id": 1,
+                        "method": "tools/list", "params": {}}, headers={
+                        "Accept": "application/json, text/event-stream",
+                        "Authorization": f"Bearer {signed()}"})
+                self.assertEqual(response.status_code, 401)
+                with sqlite3.connect(diagnostics.path) as db:
+                    self.assertEqual(db.execute("SELECT reason FROM auth_401").fetchone()[0], "jwks")
+            finally:
+                stop.set()
+                await task
+                await failing.close()
+
+
     async def test_metadata_and_initialize(self):
         metadata=await self.http.get("/.well-known/oauth-protected-resource/mcp")
         self.assertEqual(metadata.status_code,200,metadata.text)
@@ -371,3 +438,21 @@ class MiddlewareTests(unittest.IsolatedAsyncioTestCase):
             response=await http.post("/mcp",json={"id":1})
             self.assertEqual(response.status_code,503)
             self.assertLess(len(response.content),100)
+
+
+class DiagnosticBoundsTests(unittest.TestCase):
+    def test_cap_retention_and_cutoff(self):
+        now = [1_000_000]
+        with tempfile.TemporaryDirectory() as folder:
+            diagnostics = Auth401Diagnostics(Path(folder) / "auth-401.sqlite", now[0] + 200_000,
+                                              clock=lambda: now[0])
+            for _ in range(300):
+                diagnostics.record("missing")
+            with sqlite3.connect(diagnostics.path) as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM auth_401").fetchone()[0], 256)
+            now[0] += 86_401
+            diagnostics.record("claims")
+            with sqlite3.connect(diagnostics.path) as db:
+                self.assertEqual(db.execute("SELECT reason FROM auth_401").fetchall(), [("claims",)])
+            now[0] = diagnostics.until_epoch
+            self.assertIsNone(diagnostics.record("jwks"))
