@@ -116,6 +116,58 @@ class AuthTests(unittest.IsolatedAsyncioTestCase):
         now[0]+=11; self.assertIsNone(await verifier.verify_token(raw))
         await verifier.close()
 
+    async def test_jwks_outage_preserves_hard_ttl_and_retries_once(self):
+        now=[100.0]; fail=[False]; calls=[0]
+        def handler(req):
+            calls[0]+=1
+            return httpx.Response(503 if fail[0] else 200, json={"keys":[jwk()]})
+        verifier=JWKSVerifier(CONFIG,http=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+                              monotonic=lambda:now[0],cache_seconds=60,refresh_seconds=10)
+        valid=signed(); invalid=signed(key=KEY2)
+        self.assertIsNotNone(await verifier.verify_token(valid))
+        fail[0]=True
+        now[0]=151
+        self.assertIsNotNone(await verifier.verify_token(valid))
+        self.assertIsNone(await verifier.verify_token(invalid))
+        self.assertEqual(calls[0],1)
+        now[0]=155
+        self.assertEqual(await verifier._key("key-2"), (None,"jwks","http_non200"))
+        self.assertIsNotNone(await verifier.verify_token(valid))
+        now[0]=161
+        self.assertEqual(await verifier._key("key-1"), (None,"jwks","http_non200"))
+        now[0]=166
+        failures=await asyncio.gather(*[verifier._key("key-1") for _ in range(8)])
+        self.assertEqual(failures, [(None,"jwks","http_non200")]*8)
+        self.assertEqual(calls[0],3)
+        fail[0]=False; now[0]=177
+        self.assertIsNotNone(await verifier.verify_token(valid))
+        await verifier.close()
+
+    async def test_background_refresh_single_task_and_clean_close(self):
+        calls=[0]
+        def handler(req):
+            calls[0]+=1
+            return httpx.Response(200,json={"keys":[jwk()]})
+        verifier=JWKSVerifier(CONFIG,http=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+        verifier.start_background_refresh()
+        with self.assertRaises(RuntimeError):
+            verifier.start_background_refresh()
+        await asyncio.sleep(0.02)
+        self.assertEqual(calls[0],1)
+        self.assertIsNotNone(await verifier.verify_token(signed()))
+        self.assertEqual(calls[0],1)
+        await verifier.close()
+        self.assertIsNone(verifier._background_task)
+
+    async def test_bounded_fetch_timeout(self):
+        verifier=JWKSVerifier(CONFIG,http=httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda req: httpx.Response(200,json={"keys":[jwk()]}))))
+        verifier._fetch=AsyncMock(side_effect=asyncio.TimeoutError)
+        with unittest.mock.patch("telegram_assistant.auth.asyncio.wait_for", wraps=asyncio.wait_for) as bounded:
+            self.assertEqual(await verifier._key("key-1"), (None,"jwks","timeout"))
+            self.assertEqual(bounded.call_args.kwargs["timeout"], 6)
+        await verifier.close()
+
     def test_config_rejects_untrusted_endpoints_and_algorithms(self):
         from dataclasses import replace
         from telegram_assistant.security import Denied
@@ -195,7 +247,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(healthy.status_code, 200)
                 self.assertNotIn("x-mcp-diag-id", healthy.headers)
             with sqlite3.connect(path) as db:
-                rows = db.execute("SELECT request_id, status, reason FROM auth_401 ORDER BY rowid").fetchall()
+                rows = db.execute("SELECT request_id, status, reason FROM auth_events ORDER BY rowid").fetchall()
             self.assertEqual([row[2] for row in rows], ["missing", "expired", "claims"])
             self.assertTrue(all(row[1] == 401 for row in rows))
             self.assertNotIn(expired.encode(), path.read_bytes())
@@ -223,9 +275,22 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                         "method": "tools/list", "params": {}}, headers={
                         "Accept": "application/json, text/event-stream",
                         "Authorization": f"Bearer {signed()}"})
-                self.assertEqual(response.status_code, 401)
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(response.headers["retry-after"], "30")
+                self.assertNotIn("www-authenticate", response.headers)
+                self.assertEqual(response.json(), {"error": "temporarily_unavailable"})
                 with sqlite3.connect(diagnostics.path) as db:
-                    self.assertEqual(db.execute("SELECT reason FROM auth_401").fetchone()[0], "jwks")
+                    self.assertEqual(db.execute("SELECT status,reason,detail FROM auth_events").fetchone(),
+                                     (503, "jwks", "http_non200"))
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=build_app(mcp, CONFIG)),
+                                             base_url="https://telegram.example.test") as client:
+                    response = await client.post("/mcp", json={"jsonrpc":"2.0","id":2,
+                        "method":"tools/list","params":{}}, headers={
+                        "Accept":"application/json, text/event-stream",
+                        "Authorization":f"Bearer {signed()}"})
+                    self.assertEqual(response.status_code,503)
+                    self.assertNotIn("www-authenticate",response.headers)
+                    self.assertNotIn("x-mcp-diag-id",response.headers)
             finally:
                 stop.set()
                 await task
@@ -441,6 +506,21 @@ class MiddlewareTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DiagnosticBoundsTests(unittest.TestCase):
+    def test_existing_401_database_migrates_without_losing_rows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path=Path(folder)/"auth-401.sqlite"
+            with sqlite3.connect(path) as db:
+                db.execute("CREATE TABLE auth_401 (ts INTEGER NOT NULL, request_id TEXT PRIMARY KEY, "
+                           "status INTEGER NOT NULL, reason TEXT NOT NULL)")
+                db.execute("INSERT INTO auth_401 VALUES (?,?,?,?)",(100,"old-id",401,"jwks"))
+            os.chmod(path,0o600)
+            diagnostics=Auth401Diagnostics(path,1000,clock=lambda:200)
+            diagnostics.record("jwks",status=503,detail="dns_or_connect")
+            with sqlite3.connect(path) as db:
+                self.assertEqual(db.execute("SELECT status,reason,detail FROM auth_events "
+                                            "ORDER BY rowid").fetchall(),
+                                 [(401,"jwks",""),(503,"jwks","dns_or_connect")])
+
     def test_cap_retention_and_cutoff(self):
         now = [1_000_000]
         with tempfile.TemporaryDirectory() as folder:

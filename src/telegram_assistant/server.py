@@ -310,7 +310,7 @@ def build_app(mcp, config, *, read_only=False, diagnostics=None):
     paths = {r.path for r in metadata}
     app.routes[:] = [r for r in app.routes if getattr(r, "path", None) not in paths] + metadata
     limited = RequestLimits(app)
-    return Auth401Middleware(limited, diagnostics) if diagnostics is not None else limited
+    return Auth401Middleware(limited, diagnostics)
 
 
 @dataclass(frozen=True)
@@ -508,6 +508,7 @@ async def serve(args):
         read_only = getattr(args, "read_only", False)
         mcp = build_mcp(service, auth, verifier, read_only=read_only)
         app = build_app(mcp, auth, read_only=read_only, diagnostics=diagnostics)
+        verifier.start_background_refresh()
         server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0" if args.container_network else "127.0.0.1", port=8876,
                       log_config=None, access_log=False, server_header=False, proxy_headers=False,
                       limit_concurrency=8, timeout_keep_alive=5, h11_max_incomplete_event_size=16384))
