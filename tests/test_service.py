@@ -252,9 +252,13 @@ class SecurityTests(unittest.TestCase):
         g.check()
 
     @staticmethod
-    def v2(*, rules=(), grants=(), denies=(), global_per_minute=5, global_per_day=100):
-        return Policy._parse({"version":2,"grants":list(grants),"rules":list(rules),
-            "denies":list(denies),"global_limits":{"per_minute":global_per_minute,"per_day":global_per_day}})
+    def v2(*, rules=(), grants=(), denies=(), global_per_minute=5, global_per_day=100,
+           quota_mode=None):
+        data={"version":2,"grants":list(grants),"rules":list(rules),
+            "denies":list(denies),"global_limits":{"per_minute":global_per_minute,"per_day":global_per_day}}
+        if quota_mode is not None:
+            data["quota_mode"] = quota_mode
+        return Policy._parse(data)
 
     def test_v1_grants_remain_compatible_and_expiry_may_be_permanent(self):
         old={"version":1,"grants":[{"peer_id":42,"operation":"send_message","expires_at":200000,
@@ -296,6 +300,21 @@ class SecurityTests(unittest.TestCase):
         with self.assertRaises(Denied):p.authorize(42,"x",frozenset({"telegram:send"}),100,
                                                    peer_type="user",is_human=False)
 
+    def test_legacy_v2_without_quota_mode_keeps_recipient_quota(self):
+        grant={"peer_id":42,"operation":"send_message","expires_at":None,
+               "max_chars":100,"per_minute":1,"per_day":1}
+        policy=self.v2(grants=[grant],global_per_minute=50,global_per_day=500)
+        self.assertEqual(policy.quota_mode,"recipient_and_global")
+        effective=policy.authorize(42,"x",frozenset({"telegram:send"}),100,
+                                   peer_type="user",is_human=True)
+        self.assertEqual((effective.per_minute,effective.per_day),(1,1))
+        with tempfile.TemporaryDirectory() as d:
+            q=Quotas(Path(d)/"quota.sqlite")
+            q.reserve(effective,100)
+            with self.assertRaises(Denied):
+                q.reserve(effective,100.1)
+            q.close()
+
     def test_group_selectors_reject_channels_and_unknown_groups(self):
         fields={"operation":"send_message","peer_ids":[-99],"expires_at":None,
                 "max_chars":100,"per_minute":1,"per_day":20}
@@ -326,6 +345,65 @@ class SecurityTests(unittest.TestCase):
             second=Grant(43,None,100,10,100,global_per_minute=5,global_per_day=1)
             q.reserve(first,100)
             with self.assertRaises(Denied):q.reserve(second,101)
+            q.close()
+
+    def test_global_only_mode_ignores_recipient_quotas_but_retains_access_rules(self):
+        grant={"peer_id":42,"operation":"send_message","expires_at":None,
+               "max_chars":100,"per_minute":1,"per_day":1}
+        policy=self.v2(grants=[grant],denies=[{"peer_id":43,"expires_at":None}],
+                       global_per_minute=50,global_per_day=500,quota_mode="global_only")
+        effective=policy.authorize(42,"x",frozenset({"telegram:send"}),100,
+                                   peer_type="user",is_human=True)
+        self.assertIsNone(effective.per_minute)
+        self.assertIsNone(effective.per_day)
+        self.assertEqual((effective.global_per_minute,effective.global_per_day),(50,500))
+        with self.assertRaises(Denied):
+            policy.precheck(43,"x",frozenset({"telegram:send"}),100)
+        with self.assertRaises(Denied):
+            policy.precheck(44,"x",frozenset({"telegram:send"}),100)
+        with self.assertRaises(Denied) as raised:
+            policy.precheck(42,"x",frozenset({"telegram:read"}),100)
+        self.assertEqual(raised.exception.code,"send_scope_required")
+
+        media=policy.authorize_media(42,[None],frozenset({"telegram:send"}),100,
+                                     peer_type="user",is_human=True)
+        self.assertIsNone(media.per_minute)
+        self.assertIsNone(media.per_day)
+
+    def test_global_only_enforces_50_per_rolling_minute_and_rolls_back_refusal(self):
+        grant={"peer_id":42,"operation":"send_message","expires_at":None,
+               "max_chars":100,"per_minute":1,"per_day":1}
+        policy=self.v2(grants=[grant],global_per_minute=50,global_per_day=500,
+                       quota_mode="global_only")
+        effective=policy.authorize(42,"x",frozenset({"telegram:send"}),100,
+                                   peer_type="user",is_human=True)
+        with tempfile.TemporaryDirectory() as d:
+            q=Quotas(Path(d)/"quota.sqlite")
+            for _ in range(50):
+                q.reserve(effective,100)
+            with self.assertRaises(Denied) as raised:
+                q.reserve(effective,100.5)
+            self.assertEqual(raised.exception.code,"send_quota_exceeded")
+            self.assertEqual(q.db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0],50)
+            q.reserve(effective,160.001)
+            self.assertEqual(q.db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0],51)
+            q.close()
+
+    def test_global_only_enforces_500_per_rolling_day_and_rolls_back_refusal(self):
+        grant={"peer_id":42,"operation":"send_message","expires_at":None,
+               "max_chars":100,"per_minute":1,"per_day":1}
+        policy=self.v2(grants=[grant],global_per_minute=50,global_per_day=500,
+                       quota_mode="global_only")
+        effective=policy.authorize(42,"x",frozenset({"telegram:send"}),1000,
+                                   peer_type="user",is_human=True)
+        with tempfile.TemporaryDirectory() as d:
+            q=Quotas(Path(d)/"quota.sqlite")
+            for i in range(500):
+                q.reserve(effective,1000+i*61)
+            with self.assertRaises(Denied) as raised:
+                q.reserve(effective,1000+500*61)
+            self.assertEqual(raised.exception.code,"send_quota_exceeded")
+            self.assertEqual(q.db.execute("SELECT COUNT(*) FROM attempts").fetchone()[0],500)
             q.close()
 
 class ExtraWriteTests(unittest.IsolatedAsyncioTestCase):

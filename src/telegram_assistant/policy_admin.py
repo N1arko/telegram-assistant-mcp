@@ -101,7 +101,7 @@ def _atomic_write(path: Path, data):
 
 
 def update_policy(path: Path, action: str, *, selector=None, peer_ids=(), expires_at=None,
-                  max_chars=4096, per_minute=1, per_day=20, rule_id=None):
+                  max_chars=4096, per_minute=1, per_day=20, rule_id=None, quota_mode=None):
     path = _check_external_policy(Path(path))
     lock_fd = _open_lock(path)
     try:
@@ -125,6 +125,8 @@ def update_policy(path: Path, action: str, *, selector=None, peer_ids=(), expire
         if action == "set_limits":
             per_minute = integer(per_minute, 1, 100)
             per_day = integer(per_day, 1, 1000)
+            if quota_mode is not None and quota_mode not in Policy.QUOTA_MODES:
+                raise Denied("invalid_quota_mode")
         else:
             per_minute = integer(per_minute, 1, 10)
             per_day = integer(per_day, 1, 100)
@@ -174,6 +176,8 @@ def update_policy(path: Path, action: str, *, selector=None, peer_ids=(), expire
                 raise Denied("rule_missing")
         elif action == "set_limits":
             data["global_limits"] = {"per_minute": per_minute, "per_day": per_day}
+            if quota_mode is not None:
+                data["quota_mode"] = quota_mode
         else:
             raise Denied("invalid_policy_action")
 
@@ -210,6 +214,7 @@ def main(argv=None):
     limits = sub.add_parser("set-global-quotas")
     limits.add_argument("--per-minute", required=True, type=int)
     limits.add_argument("--per-day", required=True, type=int)
+    limits.add_argument("--mode", choices=Policy.QUOTA_MODES)
     sub.add_parser("validate")
 
     args = parser.parse_args(argv)
@@ -232,7 +237,8 @@ def main(argv=None):
                                 max_chars=getattr(args, "max_chars", 4096),
                                 per_minute=getattr(args, "per_minute", 1),
                                 per_day=getattr(args, "per_day", 20),
-                                rule_id=getattr(args, "rule_id", None))
+                                rule_id=getattr(args, "rule_id", None),
+                                quota_mode=getattr(args, "mode", None))
         print("policy_updated" + (f" rule_id={rule_id}" if rule_id else ""))
         return 0
     except (Denied, OSError, ValueError, TypeError):
