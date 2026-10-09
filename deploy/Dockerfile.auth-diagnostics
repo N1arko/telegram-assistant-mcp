@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=telegram-assistant-mcp:durable-monitor-8c26e14
+FROM ${BASE_IMAGE}
+ARG DIAG_COMMIT=unknown
+LABEL org.opencontainers.image.revision=${DIAG_COMMIT}
+USER root
+COPY --chown=10001:10001 src/telegram_assistant/auth.py /app/src/telegram_assistant/auth.py
+COPY --chown=10001:10001 src/telegram_assistant/auth_diagnostics.py /app/src/telegram_assistant/auth_diagnostics.py
+COPY --chown=10001:10001 src/telegram_assistant/server.py /app/src/telegram_assistant/server.py
+USER 10001:10001

@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from telethon import TelegramClient, functions, types
 from telethon.sessions import MemorySession
@@ -327,7 +327,7 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
             args = SimpleNamespace(auth_config=root/'auth.json',telegram_config=config,
                                    runtime_dir=root/'state',policy=root/'no-policy',read_only=True,
                                    container_network=True)
-            verifier = SimpleNamespace(close=AsyncMock())
+            verifier = SimpleNamespace(close=AsyncMock(), start_background_refresh=Mock())
             with patch('telegram_assistant.server.AuthConfig.load',return_value=CONFIG), \
                  patch('telethon.TelegramClient',return_value=client), \
                  patch('telegram_assistant.server.JWKSVerifier',return_value=verifier), \
@@ -335,6 +335,8 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
                  patch('telegram_assistant.server.build_app',return_value=object()), \
                  patch('uvicorn.Server',Server):
                 await serve(args)
+            verifier.start_background_refresh.assert_called_once_with()
+            verifier.close.assert_awaited_once()
             client.disconnect.assert_awaited_once()
 
 
