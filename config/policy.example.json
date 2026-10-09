@@ -3,6 +3,7 @@
   "grants": [],
   "rules": [],
   "denies": [],
+  "quota_mode": "recipient_and_global",
   "global_limits": {
     "per_minute": 5,
     "per_day": 100

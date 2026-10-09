@@ -88,6 +88,39 @@ class PolicyAdminTests(unittest.TestCase):
         with self.assertRaises(Denied):
             update_policy(self.path, "set_limits", per_minute=0, per_day=80)
 
+    def test_global_only_cli_mode_preserves_all_recipient_permissions_and_denies(self):
+        update_policy(self.path,"grant_peer",peer_ids=[42],per_minute=1,per_day=20)
+        update_policy(self.path,"grant_rule",selector="group_ids",peer_ids=[-99,-100])
+        update_policy(self.path,"deny_peer",peer_ids=[43])
+        before=Policy.load_strict(self.path).to_data()
+
+        output=io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(main(["--policy",str(self.path),"set-global-quotas",
+                                   "--per-minute","50","--per-day","500",
+                                   "--mode","global_only"]),0)
+
+        after=Policy.load_strict(self.path).to_data()
+        self.assertEqual(output.getvalue().strip(),"policy_updated")
+        self.assertEqual(after["quota_mode"],"global_only")
+        self.assertEqual(after["global_limits"],{"per_minute":50,"per_day":500})
+        self.assertEqual(after["grants"],before["grants"])
+        self.assertEqual(after["rules"],before["rules"])
+        self.assertEqual(after["denies"],before["denies"])
+        policy=Policy.load_strict(self.path)
+        self.assertEqual(policy.authorize(42,"x",frozenset({"telegram:send"}),100,
+                                          peer_type="user",is_human=True).per_day,None)
+        with self.assertRaises(Denied):
+            policy.precheck(43,"x",frozenset({"telegram:send"}),100)
+
+    def test_unknown_quota_mode_fails_closed_without_modifying_policy(self):
+        update_policy(self.path,"grant_peer",peer_ids=[42])
+        before=self.path.read_bytes()
+        with self.assertRaises(Denied):
+            update_policy(self.path,"set_limits",per_minute=50,per_day=500,
+                          quota_mode="unbounded")
+        self.assertEqual(self.path.read_bytes(),before)
+
     def test_insecure_directory_is_rejected(self):
         self.root.chmod(0o755)
         with self.assertRaises(Denied):

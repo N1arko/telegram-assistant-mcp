@@ -56,8 +56,8 @@ class Grant:
     peer_id: int
     expires_at: int | None
     max_chars: int
-    per_minute: int
-    per_day: int
+    per_minute: int | None
+    per_day: int | None
     selector: str = "peer"
     rule_id: str | None = None
     first_contact: bool = False
@@ -101,12 +101,16 @@ class DenyRule:
 
 
 class Policy:
-    def __init__(self, grants=(), rules=(), denies=(), *, global_per_minute=5, global_per_day=100):
+    QUOTA_MODES = ("recipient_and_global", "global_only")
+
+    def __init__(self, grants=(), rules=(), denies=(), *, global_per_minute=5, global_per_day=100,
+                 quota_mode="recipient_and_global"):
         self.grants = {g.peer_id: g for g in grants}
         self.rules = tuple(rules)
         self.denies = tuple(denies)
         self.global_per_minute = global_per_minute
         self.global_per_day = global_per_day
+        self.quota_mode = quota_mode
 
     @staticmethod
     def _expiry(value):
@@ -121,16 +125,21 @@ class Policy:
             if set(obj) != {"version", "grants"}:
                 raise Denied("invalid_policy")
             rules, denies, global_limits = [], [], None
+            quota_mode = "recipient_and_global"
         elif version == 2:
-            if set(obj) != {"version", "grants", "rules", "denies", "global_limits"}:
+            required_fields = {"version", "grants", "rules", "denies", "global_limits"}
+            if not required_fields <= set(obj) or set(obj) - required_fields - {"quota_mode"}:
                 raise Denied("invalid_policy")
             rules, denies, global_limits = obj["rules"], obj["denies"], obj["global_limits"]
+            quota_mode = obj.get("quota_mode", "recipient_and_global")
             if (not isinstance(rules, list) or len(rules) > 100 or
                     not isinstance(denies, list) or len(denies) > 1000 or
                     not isinstance(global_limits, dict) or
                     set(global_limits) != {"per_minute", "per_day"}):
                 raise Denied("invalid_policy")
         else:
+            raise Denied("invalid_policy")
+        if quota_mode not in cls.QUOTA_MODES:
             raise Denied("invalid_policy")
         if not isinstance(obj["grants"], list) or len(obj["grants"]) > 100:
             raise Denied("invalid_policy")
@@ -176,7 +185,7 @@ class Policy:
                   (integer(global_limits["per_minute"], 1, 1000),
                    integer(global_limits["per_day"], 1, 10000)))
         return cls(grants, parsed_rules, parsed_denies,
-                   global_per_minute=limits[0], global_per_day=limits[1])
+                   global_per_minute=limits[0], global_per_day=limits[1], quota_mode=quota_mode)
 
     @classmethod
     def load(cls, path: Path) -> Policy:
@@ -200,7 +209,8 @@ class Policy:
                            "max_chars": r.max_chars, "per_minute": r.per_minute, "per_day": r.per_day}
                           for r in self.rules],
                 "denies": [{"peer_id": d.peer_id, "expires_at": d.expires_at} for d in self.denies],
-                "global_limits": {"per_minute": self.global_per_minute, "per_day": self.global_per_day}}
+                "global_limits": {"per_minute": self.global_per_minute, "per_day": self.global_per_day},
+                "quota_mode": self.quota_mode}
 
     def candidates(self, target, now):
         target = peer_id(target)
@@ -254,6 +264,11 @@ class Policy:
                 raise Denied("text_too_long")
         return candidates
 
+    def _recipient_limits(self, matched):
+        if self.quota_mode == "global_only":
+            return None, None
+        return min(g.per_minute for g in matched), min(g.per_day for g in matched)
+
     def authorize_media(self, target: int, captions, scopes: frozenset[str], now: float, *,
                         peer_type=None, is_human=False) -> Grant:
         candidates = self.precheck_media(target, captions, scopes, now)
@@ -272,8 +287,9 @@ class Policy:
             if caption is not None and len(caption.encode("utf-16-le")) // 2 > min(g.max_chars for g in matched):
                 raise Denied("text_too_long")
         expiry = None if any(g.expires_at is None for g in matched) else max(g.expires_at for g in matched)
+        per_minute, per_day = self._recipient_limits(matched)
         return Grant(target, expiry, min(g.max_chars for g in matched),
-                     min(g.per_minute for g in matched), min(g.per_day for g in matched),
+                     per_minute, per_day,
                      selector="combined", rule_id=",".join(sorted(g.rule_id for g in matched if g.rule_id)) or None,
                      global_per_minute=self.global_per_minute, global_per_day=self.global_per_day)
 
@@ -299,8 +315,9 @@ class Policy:
         if units > min(g.max_chars for g in matched):
             raise Denied("text_too_long")
         expiry = None if any(g.expires_at is None for g in matched) else max(g.expires_at for g in matched)
+        per_minute, per_day = self._recipient_limits(matched)
         return Grant(target, expiry, min(g.max_chars for g in matched),
-                     min(g.per_minute for g in matched), min(g.per_day for g in matched),
+                     per_minute, per_day,
                      selector="combined", rule_id=",".join(sorted(g.rule_id for g in matched if g.rule_id)) or None,
                      first_contact=any(g.first_contact for g in matched),
                      global_per_minute=self.global_per_minute, global_per_day=self.global_per_day)
@@ -368,11 +385,14 @@ class Quotas:
                                     (grant.peer_id, first_contact_message_id, now))
                 except sqlite3.IntegrityError:
                     raise Denied("first_contact_already_handled") from None
-            rows = self.db.execute("SELECT at FROM attempts WHERE peer=? AND at>? ORDER BY at",
-                                   (grant.peer_id, now - 86400)).fetchall()
-            recent = [at for (at,) in rows if at > now - 60]
-            if len(rows) + count > grant.per_day or len(recent) + count > grant.per_minute:
-                raise Denied("send_quota_exceeded")
+            if (grant.per_minute is None) != (grant.per_day is None):
+                raise Denied("send_quota_unavailable")
+            if grant.per_minute is not None:
+                rows = self.db.execute("SELECT at FROM attempts WHERE peer=? AND at>? ORDER BY at",
+                                       (grant.peer_id, now - 86400)).fetchall()
+                recent = [at for (at,) in rows if at > now - 60]
+                if len(rows) + count > grant.per_day or len(recent) + count > grant.per_minute:
+                    raise Denied("send_quota_exceeded")
             all_rows = self.db.execute("SELECT at FROM attempts WHERE at>? ORDER BY at", (now - 86400,)).fetchall()
             all_recent = [at for (at,) in all_rows if at > now - 60]
             if len(all_rows) + count > grant.global_per_day or len(all_recent) + count > grant.global_per_minute:

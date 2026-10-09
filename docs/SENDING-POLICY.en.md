@@ -16,11 +16,16 @@ resolves ancestor aliases before checking the destination, rejects policy-file
 symlinks and paths inside a Git repository, and writes updates atomically.
 Never commit a live policy file.
 
-Start from `config/policy.example.json`. It has no grants or denials and sets a
-global ceiling of 5 sends per minute and 100 per day. Each recipient grant or
-rule defaults to 1 send per minute and 20 per day, with a 4,096 UTF-16-unit
-message limit. Limits combine conservatively: the lowest applicable ceiling
-wins.
+Start from `config/policy.example.json`. It has no grants or denials, defaults
+to `quota_mode: "recipient_and_global"`, and sets a global ceiling of 5 sends
+per minute and 100 per day. Each recipient grant or rule defaults to 1 send per
+minute and 20 per day, with a 4,096 UTF-16-unit message limit. In the default
+mode, both recipient and global ceilings apply, and the lowest applicable
+ceiling wins. A version 2 policy can opt into `quota_mode: "global_only"` to
+skip recipient-level rate and daily checks. Global ceilings, explicit grants
+and denials, OAuth scope checks, and the assistant's separate semantic
+permission check still apply. Version 1 and 2 policy files that omit
+`quota_mode` retain the `recipient_and_global` behavior.
 
 ## Selectors and denials
 
@@ -85,6 +90,8 @@ above. Repeat `--peer-id` for each member of a `group_ids` rule. An
 before creating it. Use `revoke-rule --rule-id` to remove a rule. `allow-peer`
 removes an exact-peer denial; it does not create a grant. Use
 `set-global-quotas --per-minute N --per-day N` to change the global ceiling.
+Add `--mode global_only` to skip recipient-level quota checks while retaining
+global ceilings; omitting `--mode` preserves the current mode.
 
 The CLI prints only a generic success or failure result and writes the owner-
 only policy through an atomic replacement. No policy management tool is
