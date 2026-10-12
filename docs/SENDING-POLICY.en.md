@@ -96,3 +96,40 @@ global ceilings; omitting `--mode` preserves the current mode.
 The CLI prints only a generic success or failure result and writes the owner-
 only policy through an atomic replacement. No policy management tool is
 available to an MCP client.
+
+## Forum topics and send failures
+
+`list_forum_topics(peer_id, limit, offset_date, offset_id, offset_topic)` reads one
+bounded page (at most 50 topics) from a resolved forum group. Pass all three
+fields from `next_offset` to continue. `scan_truncated=true` means Telegram did
+not provide enough information for a safe next offset. `get_forum_topic(peer_id,
+topic_id)` checks one topic by ID and returns its title, exact group ID, and
+closed/deleted state. `get_reply_context` also includes `forum_topic` when its
+reply anchor matches a verified topic, even if that anchor message is absent.
+Both tools use `telegram:read`, never mark messages read,
+and do not download media. Titles and message content are untrusted.
+
+For forum groups, `send_message` and `send_media` require an explicit `topic_id`.
+Use `1` for General; for other topics, the server validates the topic against
+the resolved group immediately before reserving quota, then sends to its topic
+root. A forum `reply_to` alone is not a topic address. Replies to a different
+message within a topic currently return `topic_reply_unsupported`; this avoids
+losing the topic if that message disappears during sending. Closed, hidden,
+missing, deleted, wrong-group, or non-forum topics are rejected before sending.
+The topic check does not grant permission: send scope, recipient policy, and
+quotas still apply. Topic state can change after validation; Telegram may still
+reject the call.
+
+Safe send error codes distinguish `send_scope_required` (missing OAuth send
+scope), `recipient_grant_required` (no active matching grant),
+`send_policy_denied` (explicit recipient deny), `recipient_not_eligible`
+(grant selector does not cover the resolved recipient), `send_quota_exceeded`,
+and `send_quota_unavailable`. Telegram's recognized write restrictions return
+`telegram_write_forbidden`; recognized topic and address rejections return
+`topic_unavailable` or `telegram_address_invalid`. No policy contents, token,
+message body, or raw Telegram exception is returned. `send_preflight_unavailable`
+means a lookup failed before any send attempt. `delivery_unknown`
+includes timeouts and unclassified failures after an attempt; check Telegram
+manually and never retry automatically. A historical `send_denied` means the
+old server stopped at a local policy or quota-store check before Telegram, but
+does not identify which branch.

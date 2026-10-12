@@ -64,15 +64,18 @@ class Service:
         self.lock = asyncio.Lock()
         self.snapshots = OrderedDict()
         self.cursors = OrderedDict()
+        self._send_attempted = False
 
     async def invoke(self, operation, *args, **kwargs):
         # Tool annotations are hints, not authorization.
         if "telegram:read" not in SCOPES.get():
             return {"error": "unauthorized"}
         if operation not in {"list_dialogs", "get_history", "search_messages", "get_reply_context",
+                             "list_forum_topics", "get_forum_topic",
                              "scan_updates", "view_photo", "transcribe_audio", "send_message", "send_media"}:
             return {"error": "unknown_tool"}
         async with self.lock:
+            self._send_attempted = False
             try:
                 self.gate.check()
                 timeout = (MEDIA_SEND_TIMEOUT_SECONDS if operation == "send_media" else
@@ -91,7 +94,8 @@ class Service:
                     result["retry_after_seconds"] = exc.retry_after
                 return result
             except TimeoutError:
-                return {"error": "delivery_unknown" if operation in {"send_message", "send_media"} else
+                return {"error": ("delivery_unknown" if self._send_attempted else "send_preflight_unavailable")
+                        if operation in {"send_message", "send_media"} else
                         ("media_timeout" if operation in {"view_photo", "transcribe_audio"} else "telegram_timeout")}
             except Exception as exc:
                 # Inspect structured flood fields only; never return/log repr or args.
@@ -99,7 +103,17 @@ class Service:
                     seconds = max(1, int(getattr(exc, "seconds", 60)))
                     self.gate.flood(seconds)
                     return {"error": "telegram_rate_limited", "retry_after_seconds": seconds}
-                return {"error": "delivery_unknown" if operation in {"send_message", "send_media"} else
+                if operation in {"send_message", "send_media"}:
+                    name = type(exc).__name__
+                    if name in {"ChatWriteForbiddenError", "ChatAdminRequiredError",
+                                "UserBannedInChannelError", "ChatSendPlainForbiddenError"}:
+                        return {"error": "telegram_write_forbidden"}
+                    if name in {"TopicClosedError", "TopicDeletedError"}:
+                        return {"error": "topic_unavailable"}
+                    if name in {"PeerIdInvalidError", "ReplyMessageIdInvalidError"}:
+                        return {"error": "telegram_address_invalid"}
+                return {"error": ("delivery_unknown" if self._send_attempted else "send_preflight_unavailable")
+                        if operation in {"send_message", "send_media"} else
                         ("media_unavailable" if operation in {"view_photo", "transcribe_audio"} else "telegram_unavailable")}
 
     async def view_photo(self, peer_id, message_id):
@@ -470,7 +484,75 @@ class Service:
         return {"peer_id": target, "message_id": message["id"], "sender_id": sender,
                 "date": message.get("date"), "text": text, "text_truncated": truncated,
                 "has_media": bool(message.get("has_media")), "reply_to": message.get("reply_to"),
+                "topic_id": message.get("topic_id"),
                 "reply_peer_id": message.get("reply_peer_id"), "out": bool(message.get("out", False))}
+
+    async def get_forum_topic(self, peer_id, topic_id):
+        integer(topic_id, 1, 2**31 - 1)
+        target, peer_type = await self._resolve(peer_id, return_type=True)
+        if peer_type != "group":
+            raise Denied("not_forum_group")
+        check_state = getattr(self.backend, "forum_state", None)
+        if check_state is not None and not await check_state(target):
+            raise Denied("not_forum_group")
+        topic = await self.backend.forum_topic(target, topic_id)
+        if topic is None:
+            raise Denied("topic_missing")
+        if topic["peer_id"] != target or topic["topic_id"] != topic_id:
+            raise Denied("topic_peer_mismatch")
+        if not topic["deleted"]:
+            topic = dict(topic)
+            topic["title"], topic["title_truncated"] = clip(topic["title"])
+        return {"topic": topic, "untrusted_content": True}
+
+    async def list_forum_topics(self, peer_id, limit=20, offset_date=None,
+                                offset_id=0, offset_topic=0):
+        integer(limit, 1, 50)
+        if offset_date is not None:
+            integer(offset_date, 1, 2**31 - 1)
+        integer(offset_id, 0, 2**31 - 1)
+        integer(offset_topic, 0, 2**31 - 1)
+        if (offset_date is None) != (offset_id == 0) or (offset_id == 0) != (offset_topic == 0):
+            raise Denied("invalid_topic_offset")
+        target, peer_type = await self._resolve(peer_id, return_type=True)
+        if peer_type != "group":
+            raise Denied("not_forum_group")
+        check_state = getattr(self.backend, "forum_state", None)
+        if check_state is not None and not await check_state(target):
+            raise Denied("not_forum_group")
+        topics, next_offset, truncated = await self.backend.forum_topics(
+            target, limit=limit, offset_date=offset_date,
+            offset_id=offset_id, offset_topic=offset_topic)
+        for topic in topics:
+            if topic["peer_id"] != target:
+                raise Denied("topic_peer_mismatch")
+            if not topic["deleted"]:
+                topic["title"], topic["title_truncated"] = clip(topic["title"])
+        return {"topics": topics, "next_offset": next_offset, "scan_truncated": truncated,
+                "untrusted_content": True}
+
+    async def _topic_address(self, target, peer_type, topic_id, reply_to):
+        check_state = getattr(self.backend, "forum_state", None)
+        forum = (bool(await check_state(target)) if check_state is not None and peer_type == "group"
+                 else bool(getattr(self.backend, "is_forum_group", lambda _target: False)(target)))
+        if not forum:
+            if topic_id is not None:
+                raise Denied("not_forum_group")
+            return reply_to
+        if topic_id is None:
+            raise Denied("topic_id_required")
+        topic = await self.backend.forum_topic(target, topic_id)
+        if topic is None or topic.get("deleted"):
+            raise Denied("topic_missing")
+        if topic.get("peer_id") != target or topic.get("topic_id") != topic_id:
+            raise Denied("topic_peer_mismatch")
+        if topic.get("closed") or topic.get("hidden"):
+            raise Denied("topic_unavailable")
+        if reply_to is not None and reply_to != topic_id:
+            # Telethon's high-level reply_to cannot set top_msg_id. Refuse a
+            # nested reply rather than risk it falling into General if deleted.
+            raise Denied("topic_reply_unsupported")
+        return None if topic_id == 1 else topic_id
 
     async def _messages(self, target, limit, before_id, query=None):
         integer(limit, 1, 50)
@@ -505,6 +587,16 @@ class Service:
         message = await self.backend.message(target, message_id)
         if message is None:
             return {"error": "message_missing"}
+        topic = None
+        topic_candidate = message.get("topic_id") or message.get("reply_to")
+        if (type(topic_candidate) is int and 1 <= topic_candidate <= 2**31 - 1 and
+                message.get("reply_peer_id") in {None, target} and
+                getattr(self.backend, "is_forum_group", lambda _target: False)(target)):
+            found = await self.backend.forum_topic(target, topic_candidate)
+            if (found is not None and not found["deleted"] and found["peer_id"] == target
+                    and found["topic_id"] == topic_candidate):
+                topic = dict(found)
+                topic["title"], topic["title_truncated"] = clip(topic["title"])
         before, after = await self.backend.around(target, message_id, radius)
         records = [self._record(m, target) for m in sorted([*before, message, *after], key=lambda m: m["id"])]
         reply = None
@@ -518,6 +610,7 @@ class Service:
                 reply = self._record(replied, target) if replied else None
                 reply_state = "available" if replied else "missing"
         payload = {"target_message_id": message_id, "messages": records, "replied_message": reply,
+                   "forum_topic": topic,
                    "reply_state": reply_state, "context_truncated": False, "untrusted_content": True}
         # Keep target and quote; trim outer context until bounded.
         while wire_size(payload) > MAX_BYTES and len(records) > 1:
@@ -527,8 +620,11 @@ class Service:
             payload["context_truncated"] = True
         return payload
 
-    async def send_message(self, peer_id, text, reply_to=None, first_contact_message_id=None):
+    async def send_message(self, peer_id, text, reply_to=None, first_contact_message_id=None,
+                           topic_id=None):
         target = validate_peer_id(peer_id)
+        if topic_id is not None:
+            integer(topic_id, 1, 2**31 - 1)
         if reply_to is not None:
             integer(reply_to, 1, 2**31 - 1)
         if first_contact_message_id is not None:
@@ -543,8 +639,9 @@ class Service:
         elif not first_rules or reply_to != first_contact_message_id:
             raise Denied("invalid_first_contact_reference")
         if self.quotas is None:
-            raise Denied("send_denied")
+            raise Denied("send_quota_unavailable")
         target, peer_type = await self._resolve(target, return_type=True)
+        send_reply_to = await self._topic_address(target, peer_type, topic_id, reply_to)
         needs_human = peer_type == "user" or any(
             g.selector in {"all_human_dms", "first_contact"} for g in candidates)
         is_human = False
@@ -564,26 +661,41 @@ class Service:
                 raise Denied("first_contact_unavailable") from None
             if not first_contact_verified:
                 raise Denied("first_contact_unverified")
-        if reply_to is not None and not first_contact_verified and await self.backend.message(target, reply_to) is None:
+        if reply_to is not None and topic_id is None and not first_contact_verified and await self.backend.message(target, reply_to) is None:
             raise Denied("reply_target_missing")
         # Recheck expiry after async resolution and reserve transactionally.
         grant = self.policy.authorize(target, text, SCOPES.get(), self.clock(),
                                       peer_type=peer_type, is_human=is_human,
                                       first_contact_verified=first_contact_verified)
-        self.quotas.reserve(grant, self.clock(),
-                            first_contact_message_id=first_contact_message_id if grant.first_contact else None)
         try:
-            result = await self.backend.send(target, text, reply_to)
+            self.quotas.reserve(grant, self.clock(),
+                                first_contact_message_id=first_contact_message_id if grant.first_contact else None)
+        except Denied:
+            raise
+        except Exception:
+            raise Denied("send_quota_unavailable") from None
+        try:
+            self._send_attempted = True
+            result = await self.backend.send(target, text, send_reply_to)
         except BaseException:
             if grant.first_contact and first_contact_message_id is not None:
                 self.quotas.finish_first_contact(target, first_contact_message_id, "unknown")
             raise
+        if type(result) is not int or result <= 0:
+            if grant.first_contact and first_contact_message_id is not None:
+                self.quotas.finish_first_contact(target, first_contact_message_id, "unknown")
+            raise Denied("delivery_unknown")
         if grant.first_contact and first_contact_message_id is not None:
             self.quotas.finish_first_contact(target, first_contact_message_id, "sent")
-        return {"sent": True, "peer_id": target, "message_id": result}
+        payload = {"sent": True, "peer_id": target, "message_id": result}
+        if topic_id is not None:
+            payload["topic_id"] = topic_id
+        return payload
 
-    async def send_media(self, peer_id, items, reply_to=None):
+    async def send_media(self, peer_id, items, reply_to=None, topic_id=None):
         target = validate_peer_id(peer_id)
+        if topic_id is not None:
+            integer(topic_id, 1, 2**31 - 1)
         if reply_to is not None:
             integer(reply_to, 1, 2**31 - 1)
         if not isinstance(items, list) or not 1 <= len(items) <= MAX_OUTBOUND_ITEMS:
@@ -601,7 +713,7 @@ class Service:
         captions = [item.get("caption") for item in normalized]
         candidates = self.policy.precheck_media(target, captions, SCOPES.get(), self.clock())
         if self.quotas is None:
-            raise Denied("send_denied")
+            raise Denied("send_quota_unavailable")
 
         total_bytes = 0
         with temporary_media_dir() as directory:
@@ -617,6 +729,7 @@ class Service:
                 files.append(prepared)
 
             target, peer_type = await self._resolve(target, return_type=True)
+            send_reply_to = await self._topic_address(target, peer_type, topic_id, reply_to)
             needs_human = peer_type == "user" or any(
                 grant.selector in {"all_human_dms", "first_contact"} for grant in candidates)
             is_human = False
@@ -627,7 +740,7 @@ class Service:
                     raise Denied("peer_not_human")
             grant = self.policy.authorize_media(target, captions, SCOPES.get(), self.clock(),
                                                 peer_type=peer_type, is_human=is_human)
-            if reply_to is not None and await self.backend.message(target, reply_to) is None:
+            if reply_to is not None and topic_id is None and await self.backend.message(target, reply_to) is None:
                 raise Denied("reply_target_missing")
             send = getattr(self.backend, "send_media_files", None)
             if send is None:
@@ -639,10 +752,17 @@ class Service:
             except Exception:
                 raise Denied("send_quota_unavailable") from None
             try:
-                message_ids = await send(target, files, reply_to)
+                self._send_attempted = True
+                message_ids = await send(target, files, send_reply_to)
             except BaseException:
                 # Telegram may have accepted all or part of an album before a
                 # transport failure. Never retry an uncertain media send.
                 raise
-        return {"sent": True, "peer_id": target, "message_ids": message_ids,
-                "media_count": len(files), "album": len(files) > 1}
+        if (not isinstance(message_ids, list) or len(message_ids) != len(files) or
+                any(type(value) is not int or value <= 0 for value in message_ids)):
+            raise Denied("delivery_unknown")
+        payload = {"sent": True, "peer_id": target, "message_ids": message_ids,
+                   "media_count": len(files), "album": len(files) > 1}
+        if topic_id is not None:
+            payload["topic_id"] = topic_id
+        return payload
