@@ -230,7 +230,7 @@ class OutboundMediaServiceTests(unittest.IsolatedAsyncioTestCase):
                                               selector="first_contact", first_contact=True)])
         result = await self.service.invoke("send_media", peer_id=42,
             items=[{"media_type": "document", "data_base64": encoded(b"%PDF-1.7")}])
-        self.assertEqual(result["error"], "send_denied")
+        self.assertEqual(result["error"], "recipient_not_eligible")
         self.assertEqual(self.backend.calls, [])
 
 

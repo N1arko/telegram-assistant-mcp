@@ -312,6 +312,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code,200,response.text)
         names={t["name"] for t in response.json()["result"]["tools"]}
         self.assertEqual(names,{"list_dialogs","get_history","search_messages","get_reply_context",
+                           "list_forum_topics","get_forum_topic",
                                "scan_updates","view_photo","transcribe_audio","send_message","send_media"})
         for name in ["set_policy","edit_message","delete_message","mark_as_read","download_media","transcribe_voice"]:
             result=await self.rpc("tools/call",{"name":name,"arguments":{}})
@@ -365,11 +366,11 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload,sample)
         self.service.scan_updates.assert_awaited_once_with(limit=1,cursor="previous-cursor")
     async def test_scope_and_policy_deny(self):
-        for token,code in [("fake-read","send_scope_required"),("fake-write","send_denied")]:
+        for token,code in [("fake-read","send_scope_required"),("fake-write","recipient_grant_required")]:
             response=await self.rpc("tools/call",{"name":"send_message","arguments":{"peer_id":42,"text":"test"}},token=token)
             self.assertEqual(json.loads(response.json()["result"]["content"][0]["text"])["error"],code)
         self.fake.send.assert_not_awaited()
-        for token,code in [("fake-read","send_scope_required"),("fake-write","send_denied")]:
+        for token,code in [("fake-read","send_scope_required"),("fake-write","recipient_grant_required")]:
             response=await self.rpc("tools/call",{"name":"send_media","arguments":{
                 "peer_id":42,"items":[{"media_type":"document","data_base64":"eA=="}]}},token=token)
             self.assertEqual(json.loads(response.json()["result"]["content"][0]["text"])["error"],code)

@@ -215,7 +215,7 @@ class Policy:
     def candidates(self, target, now):
         target = peer_id(target)
         if any(d.peer_id == target and d.active(now) for d in self.denies):
-            raise Denied("send_denied")
+            raise Denied("send_policy_denied")
         matches = []
         exact = self.grants.get(target)
         if exact is not None and exact.active(now):
@@ -226,7 +226,7 @@ class Policy:
                                      rule.per_day, selector=rule.selector, rule_id=rule.rule_id,
                                      first_contact=rule.selector == "first_contact"))
         if not matches:
-            raise Denied("send_denied")
+            raise Denied("recipient_grant_required")
         return tuple(matches)
 
     def precheck(self, target, text, scopes, now):
@@ -248,7 +248,7 @@ class Policy:
             raise Denied("send_scope_required")
         candidates = tuple(g for g in self.candidates(target, now) if not g.first_contact)
         if not candidates:
-            raise Denied("send_denied")
+            raise Denied("recipient_not_eligible")
         if not isinstance(captions, (list, tuple)):
             raise Denied("invalid_media_caption")
         for caption in captions:
@@ -282,7 +282,7 @@ class Policy:
             elif grant.selector in {"group_ids", "all_groups"} and peer_type == "group":
                 matched.append(grant)
         if not matched:
-            raise Denied("send_denied")
+            raise Denied("recipient_not_eligible")
         for caption in captions:
             if caption is not None and len(caption.encode("utf-16-le")) // 2 > min(g.max_chars for g in matched):
                 raise Denied("text_too_long")
@@ -308,7 +308,7 @@ class Policy:
             elif grant.selector == "first_contact" and peer_type == "user" and is_human and first_contact_verified:
                 matched.append(grant)
         if not matched:
-            raise Denied("send_denied")
+            raise Denied("recipient_not_eligible")
         # UTF-16 length was checked before contact resolution, then rechecked
         # here so changed/expired policy cannot outlive the async lookup.
         units = len(text.encode("utf-16-le")) // 2

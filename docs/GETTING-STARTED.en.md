@@ -29,7 +29,7 @@ This guide describes how to run a local, read-only MCP for personal Telegram cha
 
 ## What the server does
 
-In `--read-only` mode, the server exposes seven tools: list dialogs, incrementally scan updates, read a selected dialog’s history, search within it, get reply context, view one explicitly requested photo, and optionally transcribe one explicitly requested audio attachment. Each request is checked against an OAuth access token and is bounded by size and rate. Treat Telegram content as untrusted data.
+In `--read-only` mode, the server exposes nine tools: list dialogs, incrementally scan updates, read a selected dialog’s history, search within it, get reply context, list and verify forum topics, view one explicitly requested photo, and optionally transcribe one explicitly requested audio attachment. Each request is checked against an OAuth access token and is bounded by size and rate. Treat Telegram content as untrusted data.
 
 The code also contains `send_message` and `send_media` paths when read-only mode is disabled and a permission plus recipient grant are configured. This guide does not enable them, and real Telegram delivery has not been verified. Do not activate sending for the read-only setup described here. See [server.py](../src/telegram_assistant/server.py), [security.py](../src/telegram_assistant/security.py), and the [service tests](../tests/test_service.py) for implementation details. The local operator controls are described in the [send policy guide](SENDING-POLICY.en.md).
 

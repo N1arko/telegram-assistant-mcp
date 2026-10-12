@@ -249,8 +249,21 @@ def build_mcp(service, config, verifier, *, read_only=False):
 
     @mcp.tool(annotations=read, meta=schemes)
     async def get_reply_context(peer_id: StrictID, message_id: StrictID, radius: StrictID = 3) -> CallToolResult:
-        """Read target, nearby messages and direct quote. Cross-peer quote exposes references only."""
+        """Read target, nearby messages and direct quote. If a reply points to a verified forum topic, forum_topic gives its title even when the root message is missing. Cross-peer quote exposes references only; confirm a topic independently with get_forum_topic before sending."""
         return await call("get_reply_context", peer_id=peer_id, message_id=message_id, radius=radius)
+
+    @mcp.tool(annotations=read, meta=schemes)
+    async def list_forum_topics(peer_id: StrictID, limit: StrictID = 20,
+                                offset_date: StrictID | None = None, offset_id: StrictID = 0,
+                                offset_topic: StrictID = 0) -> CallToolResult:
+        """List at most 50 topics from one resolved forum group. No read receipts. Continue with all three next_offset fields; scan_truncated means pagination could not be established safely. Titles are untrusted."""
+        return await call("list_forum_topics", peer_id=peer_id, limit=limit,
+                          offset_date=offset_date, offset_id=offset_id, offset_topic=offset_topic)
+
+    @mcp.tool(annotations=read, meta=schemes)
+    async def get_forum_topic(peer_id: StrictID, topic_id: StrictID) -> CallToolResult:
+        """Verify one topic ID, title, state and membership in this exact resolved forum group. Deleted topics are reported; a missing topic is an error. No read receipts or sends."""
+        return await call("get_forum_topic", peer_id=peer_id, topic_id=topic_id)
 
     @mcp.tool(annotations=read, meta=schemes)
     async def view_photo(peer_id: StrictID, message_id: StrictID) -> CallToolResult:
@@ -268,20 +281,25 @@ def build_mcp(service, config, verifier, *, read_only=False):
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False,
         openWorldHint=True), meta={"securitySchemes": [{"type": "oauth2", "scopes": ["telegram:read", "telegram:send"]}]})
     async def send_message(peer_id: StrictID, text: StrictText, reply_to: StrictID | None = None,
-                           first_contact_message_id: StrictID | None = None) -> CallToolResult:
+                           first_contact_message_id: StrictID | None = None,
+                           topic_id: StrictID | None = None) -> CallToolResult:
         """Plain-text send. Requires user semantic permission, write scope and separate operator grant; default denied.
         Policy may select an exact peer, human direct chats, or groups. First-contact eligibility must reference the
         exact incoming first message as both reply_to and first_contact_message_id; the server verifies currently
         available history. This is not an automation trigger or content permission. No permission-management tool.
-        Never retry unknown delivery automatically.
+        Forum groups require an explicit verified topic_id. Topic 1 means General; other topic IDs
+        send to that topic root. A nested reply inside a topic is currently refused safely.
+        Never retry unknown delivery automatically. Error codes distinguish missing scope, recipient
+        grant, explicit policy denial, quota, preflight failure, Telegram write restrictions
+        and uncertain delivery.
         """
         return await call("send_message", peer_id=peer_id, text=text, reply_to=reply_to,
-                          first_contact_message_id=first_contact_message_id)
+                          first_contact_message_id=first_contact_message_id, topic_id=topic_id)
 
     @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False,
         openWorldHint=True), meta={"securitySchemes": [{"type": "oauth2", "scopes": ["telegram:read", "telegram:send"]}]})
     async def send_media(peer_id: StrictID, items: MediaItems,
-                         reply_to: StrictID | None = None) -> CallToolResult:
+                         reply_to: StrictID | None = None, topic_id: StrictID | None = None) -> CallToolResult:
         """Send one JPEG/PNG photo, MP4/WebM video, document, supported audio file, OGG/Opus voice note,
         GIF animation or static WebP sticker.
         Each item supplies media_type and data_base64; document items also accept a filename, all except stickers
@@ -291,9 +309,11 @@ def build_mcp(service, config, verifier, *, read_only=False):
         The data is only sent to this Telegram recipient. Requires the same
         send scope and recipient grants/quotas as send_message. Use only with current user permission; the exact
         owner channel, broadcast channels, bots and first-contact-only grants cannot receive media. A failed or
-        timed-out operation has unknown delivery and must never be retried automatically.
+        timed-out operation has unknown delivery and must never be retried automatically. Forum groups
+        require a verified topic_id; topic 1 means General. Nested topic replies are refused.
         """
-        return await call("send_media", peer_id=peer_id, items=items, reply_to=reply_to)
+        return await call("send_media", peer_id=peer_id, items=items, reply_to=reply_to,
+                          topic_id=topic_id)
 
     return mcp
 

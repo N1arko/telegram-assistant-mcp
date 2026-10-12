@@ -34,6 +34,8 @@ class Fake:
         self.human_check_calls = []
         self.first_inbound = True
         self.first_contact_barrier = None
+        self.forum = False
+        self.topics = {}
     def start_dialogs(self, archived):
         return {'rows': [dict(d) for d in self.rows if archived is None or d['archived'] == archived], 'at': 0}
     async def dialog_page(self, state, limit):
@@ -60,6 +62,14 @@ class Fake:
         before = [m for m in self.items if m["id"] < message_id][:radius]
         after = sorted([m for m in self.items if m["id"] > message_id], key=lambda m:m["id"])[:radius]
         return before, after
+    def is_forum_group(self, target):
+        return self.forum
+    async def forum_state(self, target):
+        return self.forum
+    async def forum_topic(self, target, topic_id):
+        return self.topics.get(topic_id)
+    async def forum_topics(self, target, *, limit, offset_date, offset_id, offset_topic):
+        return list(self.topics.values())[:limit], None, False
 
 
 class ServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -138,7 +148,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
     async def test_default_deny_even_with_write_scope(self):
         SCOPES.set(frozenset({"telegram:read","telegram:send"}))
         a = await self.call("send_message", peer_id=42, text="test")
-        self.assertEqual(a["error"], "send_denied")
+        self.assertEqual(a["error"], "recipient_grant_required")
         self.fake.send.assert_not_awaited()
     async def test_peer_mismatch_and_wrong_type(self):
         self.fake.resolve = AsyncMock(return_value=(43,"user"))
@@ -193,10 +203,10 @@ class WriteTests(unittest.IsolatedAsyncioTestCase):
         SCOPES.set(frozenset({"telegram:read"}))
         self.assertEqual((await self.s.invoke("send_message",peer_id=42,text="x"))["error"],"send_scope_required")
         SCOPES.set(frozenset({"telegram:read","telegram:send"}))
-        self.assertEqual((await self.s.invoke("send_message",peer_id=43,text="x"))["error"],"send_denied")
+        self.assertEqual((await self.s.invoke("send_message",peer_id=43,text="x"))["error"],"recipient_grant_required")
         self.assertEqual((await self.s.invoke("send_message",peer_id=42,text="😀"*11))["error"],"text_too_long")
         self.now=200000
-        self.assertEqual((await self.s.invoke("send_message",peer_id=42,text="x"))["error"],"send_denied")
+        self.assertEqual((await self.s.invoke("send_message",peer_id=42,text="x"))["error"],"recipient_grant_required")
         self.fake.send.assert_not_awaited()
     async def test_concurrent_requests_and_restart_quota(self):
         a,b=await asyncio.gather(*(self.s.invoke("send_message",peer_id=42,text="test") for _ in range(2)))
@@ -436,7 +446,7 @@ class ExtraWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["sent"])
         self.fake.send.reset_mock()
         denied=await self.s.invoke("send_message",peer_id=-98,text="operator-approved text")
-        self.assertEqual(denied["error"],"send_denied")
+        self.assertEqual(denied["error"],"recipient_grant_required")
         self.fake.send.assert_not_awaited()
     async def test_expiry_rechecked_after_resolution(self):
         async def resolve(target):
@@ -444,7 +454,7 @@ class ExtraWriteTests(unittest.IsolatedAsyncioTestCase):
             return target,"user"
         self.fake.resolve=resolve
         result=await self.s.invoke("send_message",peer_id=42,text="test")
-        self.assertEqual(result["error"],"send_denied")
+        self.assertEqual(result["error"],"recipient_grant_required")
         self.fake.send.assert_not_awaited()
 
     async def test_bulk_human_rule_excludes_bots_and_groups(self):
@@ -458,7 +468,7 @@ class ExtraWriteTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.fake.send.await_count)
         self.fake.human_user=True
         self.fake.peer_type="group"
-        self.assertEqual((await self.s.invoke("send_message",peer_id=44,text="approved by user"))["error"],"send_denied")
+        self.assertEqual((await self.s.invoke("send_message",peer_id=44,text="approved by user"))["error"],"recipient_not_eligible")
         self.assertFalse(self.fake.send.await_count)
 
     async def test_selected_group_rule_rejects_other_peer_and_channel(self):
@@ -468,7 +478,7 @@ class ExtraWriteTests(unittest.IsolatedAsyncioTestCase):
         self.fake.peer_type="group"
         self.assertTrue((await self.s.invoke("send_message",peer_id=-99,text="user instruction"))["sent"])
         self.fake.send.reset_mock()
-        self.assertEqual((await self.s.invoke("send_message",peer_id=-98,text="user instruction"))["error"],"send_denied")
+        self.assertEqual((await self.s.invoke("send_message",peer_id=-98,text="user instruction"))["error"],"recipient_grant_required")
         self.assertFalse(self.fake.send.await_count)
         self.fake.peer_type="channel"
         self.assertEqual((await self.s.invoke("send_message",peer_id=-99,text="user instruction"))["error"],"peer_mismatch")

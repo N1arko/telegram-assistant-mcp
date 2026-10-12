@@ -314,7 +314,92 @@ class TelethonBackend:
                 "sender_id": message.sender_id, "has_media": message.media is not None,
                 "out": bool(getattr(message, "out", False)),
                 "reply_to": getattr(reply, "reply_to_msg_id", None),
+                "topic_id": getattr(reply, "reply_to_top_id", None),
                 "reply_peer_id": get_peer_id(reply_peer) if reply_peer else None}
+
+    def _forum_entity(self, target):
+        from telethon import types
+        entity = self.peers.get(target)
+        if (not isinstance(entity, types.Channel) or not entity.megagroup or
+                not getattr(entity, "forum", False)):
+            raise Denied("not_forum_group")
+        return entity
+
+    def is_forum_group(self, target):
+        try:
+            self._forum_entity(target)
+            return True
+        except Denied:
+            return False
+
+    async def forum_state(self, target):
+        """Refresh a supergroup's forum flag before choosing a send address."""
+        from telethon import functions, types
+        from telethon.utils import get_peer_id
+        entity = self.peers.get(target)
+        if isinstance(entity, types.Chat):
+            return False
+        if not isinstance(entity, types.Channel) or not entity.megagroup:
+            raise Denied("forum_state_unavailable")
+        await self.activate()
+        result = await self.client(functions.channels.GetFullChannelRequest(channel=entity))
+        matching = [item for item in result.chats if get_peer_id(item) == target]
+        if (len(matching) != 1 or not isinstance(matching[0], types.Channel) or
+                not matching[0].megagroup or getattr(matching[0], "min", False)):
+            raise Denied("forum_state_unavailable")
+        self._remember(matching[0])
+        return bool(getattr(matching[0], "forum", False))
+
+    @staticmethod
+    def _topic(target, item):
+        from telethon import types
+        from telethon.utils import get_peer_id
+        if isinstance(item, types.ForumTopicDeleted):
+            return {"peer_id": target, "topic_id": item.id, "deleted": True}
+        if not isinstance(item, types.ForumTopic) or get_peer_id(item.peer) != target:
+            raise Denied("topic_peer_mismatch")
+        return {"peer_id": target, "topic_id": item.id, "title": item.title,
+                "title_missing": bool(item.title_missing),
+                "closed": bool(item.closed), "hidden": bool(item.hidden), "deleted": False,
+                "top_message_id": item.top_message,
+                "date": item.date.isoformat() if item.date else None}
+
+    async def forum_topic(self, target, topic_id):
+        from telethon import functions
+        entity = self._forum_entity(target)
+        await self.activate()
+        result = await self.client(functions.messages.GetForumTopicsByIDRequest(
+            peer=entity, topics=[topic_id]))
+        rows = [self._topic(target, item) for item in result.topics[:1]]
+        return next((row for row in rows if row["topic_id"] == topic_id), None)
+
+    async def forum_topics(self, target, *, limit, offset_date=None, offset_id=0, offset_topic=0):
+        from datetime import datetime, timezone
+        from telethon import functions
+        entity = self._forum_entity(target)
+        await self.activate()
+        date = datetime.fromtimestamp(offset_date, timezone.utc) if offset_date else None
+        result = await self.client(functions.messages.GetForumTopicsRequest(
+            peer=entity, q=None, offset_date=date, offset_id=offset_id,
+            offset_topic=offset_topic, limit=limit))
+        rows = [self._topic(target, item) for item in result.topics[:limit]]
+        next_offset = None
+        # Telegram may return fewer rows than requested even when more exist.
+        # Continue until an empty page rather than inferring completion from count.
+        has_more = bool(rows)
+        if has_more and not rows[-1]["deleted"]:
+            last = rows[-1]
+            latest = next((m for m in result.messages[:200] if m is not None and
+                           m.id == last["top_message_id"]), None)
+            last_date = getattr(latest, "date", None)
+            if last_date is not None:
+                candidate = {"offset_date": int(last_date.timestamp()),
+                             "offset_id": last["top_message_id"],
+                             "offset_topic": last["topic_id"]}
+                if (candidate["offset_date"], candidate["offset_id"], candidate["offset_topic"]) != (
+                        offset_date or 0, offset_id, offset_topic):
+                    next_offset = candidate
+        return rows, next_offset, has_more and next_offset is None
 
     async def history(self, target, *, limit, before_id=None, query=None):
         await self.activate()
