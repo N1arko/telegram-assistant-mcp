@@ -133,6 +133,18 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         self.fake.read_receipt.assert_not_awaited()
         self.fake.download_media.assert_not_awaited()
         self.fake.send.assert_not_awaited()
+    async def test_reads_do_not_consume_local_limit_and_writes_still_do(self):
+        self.s.gate = RateGate(limit=1)
+        for _ in range(11):
+            self.assertNotIn("error", await self.call("get_history", peer_id=42, limit=3))
+        self.assertEqual(list(self.s.gate.calls), [])
+
+        SCOPES.set(frozenset({"telegram:read", "telegram:send"}))
+        first = await self.call("send_message", peer_id=42, text="test")
+        second = await self.call("send_message", peer_id=42, text="test")
+        self.assertEqual(first["error"], "recipient_grant_required")
+        self.assertEqual(second["error"], "local_rate_limited")
+        self.fake.send.assert_not_awaited()
     async def test_argument_bounds(self):
         for kw in [{"peer_id":42,"limit":0}, {"peer_id":42,"limit":51}, {"peer_id":True},
                    {"peer_id":"@someone"}, {"peer_id":0}, {"peer_id":42,"before_id":-1}]:
@@ -172,6 +184,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         class FloodWaitError(Exception):
             seconds=123
         self.fake.history = AsyncMock(side_effect=FloodWaitError("sensitive text"))
+        self.s.gate = RateGate(limit=1)
         a = await self.call("get_history",peer_id=42)
         self.assertEqual(a,{"error":"telegram_rate_limited","retry_after_seconds":123})
         b = await self.call("get_history",peer_id=42)

@@ -20,6 +20,12 @@ from .media import (ImageResult, MAX_AUDIO_INPUT_BYTES, MAX_IMAGE_PREVIEW_BYTES,
 SCOPES: ContextVar[frozenset[str]] = ContextVar("telegram_assistant_scopes", default=frozenset())
 MAX_BYTES = 48 * 1024
 MEDIA_SEND_TIMEOUT_SECONDS = 120
+READ_OPERATIONS = frozenset({
+    "list_dialogs", "get_history", "search_messages", "get_reply_context",
+    "list_forum_topics", "get_forum_topic", "scan_updates", "view_photo", "transcribe_audio",
+})
+WRITE_OPERATIONS = frozenset({"send_message", "send_media"})
+SUPPORTED_OPERATIONS = READ_OPERATIONS | WRITE_OPERATIONS
 
 
 def clip(value, limit=200):
@@ -70,14 +76,12 @@ class Service:
         # Tool annotations are hints, not authorization.
         if "telegram:read" not in SCOPES.get():
             return {"error": "unauthorized"}
-        if operation not in {"list_dialogs", "get_history", "search_messages", "get_reply_context",
-                             "list_forum_topics", "get_forum_topic",
-                             "scan_updates", "view_photo", "transcribe_audio", "send_message", "send_media"}:
+        if operation not in SUPPORTED_OPERATIONS:
             return {"error": "unknown_tool"}
         async with self.lock:
             self._send_attempted = False
             try:
-                self.gate.check()
+                self.gate.check(count_local=operation not in READ_OPERATIONS)
                 timeout = (MEDIA_SEND_TIMEOUT_SECONDS if operation == "send_media" else
                            MEDIA_TIMEOUT_SECONDS if operation in {"view_photo", "transcribe_audio"} else 20)
                 result = await asyncio.wait_for(getattr(self, operation)(*args, **kwargs), timeout)

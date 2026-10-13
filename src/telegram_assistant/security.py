@@ -706,7 +706,7 @@ class RateGate:
             self.failed = True
             raise Denied('rate_state_unavailable') from None
 
-    def check(self):
+    def check(self, *, count_local=True):
         if self.failed:
             raise Denied('rate_state_unavailable')
         now = self.clock()
@@ -714,10 +714,11 @@ class RateGate:
             raise Denied("telegram_rate_limited", math.ceil(self.blocked_until - now))
         while self.calls and self.calls[0] <= now - 60:
             self.calls.popleft()
-        if len(self.calls) >= self.limit:
+        if count_local and len(self.calls) >= self.limit:
             raise Denied("local_rate_limited", math.ceil(60 - (now - self.calls[0])))
-        self.calls.append(now)
-        self._persist()
+        if count_local:
+            self.calls.append(now)
+            self._persist()
 
     def flood(self, seconds: int):
         self.blocked_until = max(self.blocked_until, self.clock() + max(1, seconds))
