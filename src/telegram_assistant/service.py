@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 10644)
-Total output lines: 772
-
 """Dependency-free restricted service, injectable backend for offline testing."""
 from __future__ import annotations
 
@@ -363,7 +360,52 @@ class Service:
                     messages.pop()
                     if messages:
                         delivery["limit"] = len(messages)
-               …644 tokens truncated… The in-memory snapshot cursor is only a fast path. Resume from
+                        delivery["ack_id"] = messages[-1]["message_id"]
+                        delivery["has_more"] = True
+                        state["inflight"] = delivery
+                        self.quotas.save_monitor_state(state)
+                    payload = self._monitor_output(
+                        messages, delivery, state, self.quotas.monitor_pending_count())
+                return bounded(payload)
+            if cursor != delivery["out_cursor"]:
+                raise Denied("invalid_cursor")
+            state = self.quotas.acknowledge_monitor_page(state, delivery)
+        elif cursor != state["last_acked_cursor"]:
+            raise Denied("invalid_cursor")
+
+        # Keep discovery moving while a large old queue drains, but cap the
+        # catalogue at one RPC per three newly acknowledged scan calls. Empty
+        # queues and small catalogues still finish a sweep as quickly as one
+        # bounded page per call. New activity normally promotes its dialog to
+        # Telegram's newest-dialog page, so this gives a three-call freshness
+        # bound without spending one extra catalogue RPC on every backlog page.
+        pending_before = self.quotas.monitor_pending_count()
+        catalogue_due = (not state["sweep_started"] or pending_before == 0 or
+                         state["catalog_calls_since_refresh"] >= 2)
+        if catalogue_due:
+            fresh = not state["sweep_started"]
+            if state["catalog_finished"]:
+                state.update({"catalog_cursor": None, "catalog_finished": False,
+                              "catalog_complete": False, "catalog_truncated": False,
+                              "catalog_checkpoint": None, "catalog_calls_since_refresh": 0,
+                              "coverage_restarted": False, "sweep_started": True})
+                fresh = True
+                self.quotas.save_monitor_state(state)
+            elif fresh:
+                state["sweep_started"] = True
+                self.quotas.save_monitor_state(state)
+
+            try:
+                listing = await self.list_dialogs(
+                    archived=None, limit=50, cursor=state["catalog_cursor"],
+                    _monitor_metadata=True, _fresh=fresh,
+                    _checkpoint=(state["catalog_checkpoint"]
+                                 if state["catalog_cursor"] is None else None))
+            except Denied as exc:
+                if (state["catalog_cursor"] is None or
+                        exc.code not in {"invalid_cursor", "cursor_expired_or_mismatched"}):
+                    raise
+                # The in-memory snapshot cursor is only a fast path. Resume from
                 # the last stable Telethon offset persisted with monitor state,
                 # or restart from page one if a backend cannot provide one.
                 checkpoint = state["catalog_checkpoint"]
