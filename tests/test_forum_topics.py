@@ -136,6 +136,38 @@ class ForumServiceTests(unittest.IsolatedAsyncioTestCase):
         self.fake.send.assert_not_awaited()
         self.assertEqual(self.quotas.db.execute("SELECT count(*) FROM attempts").fetchone()[0], 0)
 
+    async def test_reply_with_duplicate_group_entities_and_conflicting_state(self):
+        class Client:
+            def __init__(self):
+                self.call = AsyncMock()
+                self.get_input_entity = AsyncMock(return_value=types.InputPeerChannel(99, 123))
+            async def __call__(self, request):
+                return await self.call(request)
+
+        client = Client()
+        backend = TelethonBackend(client)
+        group = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                              megagroup=True, forum=False, access_hash=123)
+        peer_id = backend._remember(group)
+        backend.message = AsyncMock(return_value={"id": 993})
+        backend.send = AsyncMock(return_value=20000)
+        self.service.backend = backend
+        self.service.policy = Policy([Grant(peer_id, None, 200, 2, 4)])
+        client.call.return_value = NS(chats=[group, group])
+        result = await self.service.invoke("send_message", peer_id=peer_id,
+                                           text="synthetic", reply_to=993)
+        self.assertTrue(result["sent"])
+        backend.send.assert_awaited_once_with(peer_id, "synthetic", 993)
+
+        conflicting = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                                    megagroup=True, forum=True, min=True)
+        client.call.return_value = NS(chats=[group, conflicting])
+        result = await self.service.invoke("send_message", peer_id=peer_id,
+                                           text="synthetic", reply_to=993)
+        self.assertEqual(result, {"error": "forum_state_unavailable"})
+        self.assertEqual(backend.send.await_count, 1)
+        self.assertEqual(self.quotas.db.execute("SELECT count(*) FROM attempts").fetchone()[0], 1)
+
     async def test_missing_quota_store_is_distinct_from_recipient_denial(self):
         self.service.quotas = None
         self.assertEqual((await self.service.invoke("send_message", peer_id=-99,
@@ -197,6 +229,56 @@ class ForumBackendTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(Denied) as error:
                 await backend.forum_state(peer_id)
             self.assertEqual(error.exception.code, "forum_state_unavailable")
+
+    async def test_forum_state_accepts_agreeing_duplicates_from_migrated_group(self):
+        class Client:
+            def __init__(self):
+                self.call = AsyncMock()
+            async def __call__(self, request):
+                return await self.call(request)
+
+        client = Client()
+        backend = TelethonBackend(client)
+        old_chat = types.Chat(id=123, title="Old group", photo=None, participants_count=0,
+                              date=None, version=1)
+        for forum in (False, True):
+            with self.subTest(forum=forum):
+                full = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                                     megagroup=True, forum=forum)
+                minimal = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                                        megagroup=True, forum=forum, min=True)
+                peer_id = backend._remember(full)
+                for chats in ([full, old_chat, full], [minimal, old_chat, full],
+                              [minimal, minimal]):
+                    client.call.return_value = NS(chats=chats)
+                    self.assertIs(await backend.forum_state(peer_id), forum)
+                    self.assertIs(backend.peers[peer_id], full if full in chats else minimal)
+
+    async def test_forum_state_rejects_conflicting_or_unknown_duplicates(self):
+        class Client:
+            def __init__(self):
+                self.call = AsyncMock()
+            async def __call__(self, request):
+                return await self.call(request)
+
+        client = Client()
+        backend = TelethonBackend(client)
+        original = types.Channel(id=99, title="Cached", photo=None, date=None,
+                                 megagroup=True, forum=True)
+        peer_id = backend._remember(original)
+        known = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                              megagroup=True, forum=False)
+        for changes in ({"forum": True}, {"forum": None}, {"forum": 0},
+                        {"forum": False, "megagroup": False, "broadcast": True}):
+            with self.subTest(changes=changes):
+                fields = {"megagroup": True, **changes}
+                other = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                                      **fields)
+                client.call.return_value = NS(chats=[known, other])
+                with self.assertRaises(Denied) as error:
+                    await backend.forum_state(peer_id)
+                self.assertEqual(error.exception.code, "forum_state_unavailable")
+                self.assertIs(backend.peers[peer_id], original)
 
     async def test_exact_topic_rpc_and_bounded_page_no_receipts(self):
         class Client:

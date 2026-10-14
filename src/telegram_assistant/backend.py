@@ -345,17 +345,21 @@ class TelethonBackend:
         await self.activate()
         result = await self.client(functions.channels.GetFullChannelRequest(channel=entity))
         matching = [item for item in result.chats if get_peer_id(item) == target]
-        if (len(matching) != 1 or not isinstance(matching[0], types.Channel) or
-                not (matching[0].megagroup or matching[0].gigagroup)):
+        if not matching or any(
+                not isinstance(item, types.Channel) or
+                not (item.megagroup or item.gigagroup) for item in matching):
             raise Denied("forum_state_unavailable")
         # Telegram carries the `forum` flag on Channel(min) entities too. The
         # matching full-channel response is fresh; reject identity/type gaps,
         # but do not treat a min entity's known forum flag as unknown.
-        forum = getattr(matching[0], "forum", None)
-        if type(forum) is not bool:
+        # A migrated group can occur more than once in the same response.
+        # Every matching entity must carry the same known forum state.
+        states = [getattr(item, "forum", None) for item in matching]
+        if any(type(state) is not bool for state in states) or len(set(states)) != 1:
             raise Denied("forum_state_unavailable")
-        self._remember(matching[0])
-        return forum
+        fresh = next((item for item in matching if not item.min), matching[0])
+        self._remember(fresh)
+        return states[0]
 
     @staticmethod
     def _topic(target, item):
