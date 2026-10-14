@@ -128,6 +128,14 @@ class ForumServiceTests(unittest.IsolatedAsyncioTestCase):
         self.fake.send.assert_not_awaited()
         self.assertEqual(self.quotas.db.execute("SELECT count(*) FROM attempts").fetchone()[0], 0)
 
+    async def test_unknown_forum_state_fails_closed_before_quota_or_send(self):
+        self.fake.forum_state = AsyncMock(side_effect=Denied("forum_state_unavailable"))
+        result = await self.service.invoke("send_message", peer_id=-99,
+                                           text="synthetic", topic_id=14381)
+        self.assertEqual(result, {"error": "forum_state_unavailable"})
+        self.fake.send.assert_not_awaited()
+        self.assertEqual(self.quotas.db.execute("SELECT count(*) FROM attempts").fetchone()[0], 0)
+
     async def test_missing_quota_store_is_distinct_from_recipient_denial(self):
         self.service.quotas = None
         self.assertEqual((await self.service.invoke("send_message", peer_id=-99,
@@ -136,6 +144,60 @@ class ForumServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ForumBackendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_forum_state_accepts_fresh_min_channel_flag(self):
+        class Client:
+            def __init__(self):
+                self.call = AsyncMock()
+            async def __call__(self, request):
+                return await self.call(request)
+
+        client = Client()
+        backend = TelethonBackend(client)
+        entity = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                               megagroup=True, forum=False)
+        peer_id = backend._remember(entity)
+        fresh_min = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                                  megagroup=True, forum=True, min=True)
+        client.call.return_value = NS(chats=[fresh_min])
+
+        self.assertTrue(await backend.forum_state(peer_id))
+        self.assertIs(backend.peers[peer_id], fresh_min)
+        self.assertIsInstance(client.call.await_args.args[0],
+                              functions.channels.GetFullChannelRequest)
+
+        fresh_min_nonforum = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                                           megagroup=True, forum=False, min=True)
+        client.call.return_value = NS(chats=[fresh_min_nonforum])
+        self.assertFalse(await backend.forum_state(peer_id))
+
+        gigagroup = types.Channel(id=100, title="Synthetic large group", photo=None, date=None,
+                                  megagroup=False, gigagroup=True, forum=False)
+        gigagroup_id = backend._remember(gigagroup)
+        fresh_gigagroup = types.Channel(id=100, title="Synthetic large group", photo=None,
+                                        date=None, megagroup=False, gigagroup=True, forum=False)
+        client.call.return_value = NS(chats=[fresh_gigagroup])
+        self.assertFalse(await backend.forum_state(gigagroup_id))
+
+    async def test_forum_state_unknown_or_mismatched_entity_stays_denied(self):
+        class Client:
+            def __init__(self):
+                self.call = AsyncMock()
+            async def __call__(self, request):
+                return await self.call(request)
+
+        client = Client()
+        backend = TelethonBackend(client)
+        entity = types.Channel(id=99, title="Synthetic", photo=None, date=None,
+                               megagroup=True, forum=True)
+        peer_id = backend._remember(entity)
+
+        for chats in ([], [types.Channel(id=98, title="Other", photo=None, date=None,
+                                         megagroup=True, forum=True)]):
+            client.call.return_value = NS(chats=chats)
+            with self.assertRaises(Denied) as error:
+                await backend.forum_state(peer_id)
+            self.assertEqual(error.exception.code, "forum_state_unavailable")
+
     async def test_exact_topic_rpc_and_bounded_page_no_receipts(self):
         class Client:
             def __init__(self):
