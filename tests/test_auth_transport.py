@@ -5,8 +5,11 @@ import sqlite3
 import tempfile
 import time
 import unittest
+import io
+import wave
 from pathlib import Path
 from unittest.mock import AsyncMock
+from types import SimpleNamespace
 
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -15,7 +18,8 @@ from telegram_assistant.auth import AuthConfig, JWKSVerifier, validate_claims
 from telegram_assistant.auth_diagnostics import Auth401Diagnostics
 from telegram_assistant.server import RequestLimits, build_app, build_mcp
 from telegram_assistant.service import MAX_BYTES, SCOPES, Service
-from telegram_assistant.media import ImageResult, MAX_MEDIA_RESPONSE_BYTES
+from telegram_assistant.media import (AudioResult, ImageResult, MAX_AUDIO_RESPONSE_BYTES,
+                                      MAX_MEDIA_RESPONSE_BYTES)
 from test_service import Fake
 
 
@@ -313,7 +317,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         names={t["name"] for t in response.json()["result"]["tools"]}
         self.assertEqual(names,{"list_dialogs","get_history","search_messages","get_reply_context",
                            "list_forum_topics","get_forum_topic",
-                               "scan_updates","view_photo","transcribe_audio","send_message","send_media"})
+                               "scan_updates","view_photo","get_audio","read_document",
+                               "transcribe_audio","send_message","send_media"})
         for name in ["set_policy","edit_message","delete_message","mark_as_read","download_media","transcribe_voice"]:
             result=await self.rpc("tools/call",{"name":name,"arguments":{}})
             self.assertTrue(result.json()["result"]["isError"])
@@ -332,6 +337,65 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["mimeType"],"image/jpeg")
         import base64
         self.assertEqual(base64.b64decode(item["data"]),preview)
+
+    async def test_audio_returns_native_audio_with_separate_bounded_envelope(self):
+        audio=b"audio" * 40_000
+        self.service.get_audio=AsyncMock(return_value=AudioResult(audio,"audio/wav"))
+        response=await self.rpc("tools/call",{"name":"get_audio",
+            "arguments":{"peer_id":42,"message_id":9}})
+        self.assertEqual(response.status_code,200,response.text[:200])
+        self.assertGreater(len(response.content),MAX_BYTES)
+        self.assertLessEqual(len(response.content),MAX_AUDIO_RESPONSE_BYTES)
+        item=response.json()["result"]["content"][0]
+        self.assertEqual(item["type"],"audio")
+        self.assertEqual(item["mimeType"],"audio/wav")
+        import base64
+        self.assertEqual(base64.b64decode(item["data"]),audio)
+
+    async def test_synthetic_audio_and_text_document_reads_through_mcp_http(self):
+        audio_buffer = io.BytesIO()
+        with wave.open(audio_buffer, "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(8000)
+            output.writeframes(b"\x00\x00" * 16)
+        audio = audio_buffer.getvalue()
+        document = b"Synthetic claim text through MCP HTTP"
+        fetched = []
+
+        async def fetch_media_file(target, message_id, *, kind, destination, max_bytes):
+            fetched.append((target, message_id, kind, max_bytes))
+            if kind == "audio":
+                destination.write_bytes(audio)
+                return {"declared_mime": "audio/wav"}
+            if kind == "document":
+                destination.write_bytes(document)
+                return {"declared_mime": "text/plain"}
+            self.fail(f"unexpected media kind: {kind}")
+
+        self.fake.fetch_media_file = AsyncMock(side_effect=fetch_media_file)
+        transcribe = AsyncMock()
+        self.service.transcriber = SimpleNamespace(transcribe=transcribe)
+
+        audio_response = await self.rpc("tools/call", {"name": "get_audio",
+            "arguments": {"peer_id": 42, "message_id": 9}})
+        self.assertEqual(audio_response.status_code, 200, audio_response.text[:200])
+        audio_item = audio_response.json()["result"]["content"][0]
+        self.assertEqual((audio_item["type"], audio_item["mimeType"]), ("audio", "audio/wav"))
+        import base64
+        self.assertEqual(base64.b64decode(audio_item["data"]), audio)
+
+        document_response = await self.rpc("tools/call", {"name": "read_document",
+            "arguments": {"peer_id": 42, "message_id": 10}})
+        self.assertEqual(document_response.status_code, 200, document_response.text[:200])
+        document_result = json.loads(document_response.json()["result"]["content"][0]["text"])
+        self.assertEqual(document_result["text"], document.decode())
+        self.assertTrue(document_result["untrusted_content"])
+        self.assertEqual(fetched, [(42, 9, "audio", 2 * 1024 * 1024),
+                                   (42, 10, "document", 8 * 1024 * 1024)])
+        transcribe.assert_not_awaited()
+        self.fake.send.assert_not_awaited()
+        self.fake.send_media_files.assert_not_awaited()
 
     async def test_non_photo_tool_keeps_the_48k_asgi_response_cap(self):
         body=b'{"oversized":"' + b"x" * (MAX_BYTES + 1024) + b'"}'

@@ -47,6 +47,36 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.client.download_media.assert_not_awaited()
         self.client.send_message.assert_not_awaited()
 
+    def test_message_records_classify_media_without_downloading_it(self):
+        class DocumentAttributeAudio:
+            def __init__(self, voice=False):
+                self.voice = voice
+
+        class DocumentAttributeVideo:
+            pass
+
+        class DocumentAttributeSticker:
+            pass
+
+        class DocumentAttributeAnimated:
+            pass
+
+        def record(media, *, photo=None, document=None):
+            return TelethonBackend.record(NS(id=7, message="caption", date=None, sender_id=42,
+                media=media, photo=photo, document=document, reply_to=None, out=False))
+
+        self.assertEqual(record(None)["media_type"], None)
+        self.assertEqual(record(NS(), photo=NS())["media_type"], "photo")
+        self.assertEqual(record(NS(), document=NS(attributes=[DocumentAttributeAudio(True)]))["media_type"], "voice")
+        self.assertEqual(record(NS(), document=NS(attributes=[DocumentAttributeAudio(False)]))["media_type"], "audio")
+        self.assertEqual(record(NS(), document=NS(attributes=[DocumentAttributeVideo()]))["media_type"], "video")
+        self.assertEqual(record(NS(), document=NS(attributes=[DocumentAttributeAnimated()]))["media_type"], "animation")
+        self.assertEqual(record(NS(), document=NS(attributes=[DocumentAttributeSticker()]))["media_type"], "sticker")
+        self.assertEqual(record(NS(), document=NS(attributes=[]))["media_type"], "document")
+        self.assertEqual(record(NS())["media_type"], "other")
+        self.assertFalse(record(None)["has_media"])
+        self.assertTrue(record(NS(), document=NS(attributes=[]))["has_media"])
+
     async def test_incremental_messages_use_bounded_oldest_first_id_range(self):
         user=User(id=42)
         self.backend._remember(user)

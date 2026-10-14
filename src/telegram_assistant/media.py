@@ -14,6 +14,10 @@ import shutil
 import tempfile
 import time
 import unicodedata
+import zipfile
+import xml.etree.ElementTree as ET
+from xml.parsers import expat
+from io import BytesIO
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -25,7 +29,16 @@ MAX_IMAGE_PIXELS = 12_000_000
 MAX_IMAGE_PREVIEW_EDGE = 1280
 MAX_IMAGE_PREVIEW_BYTES = 256 * 1024
 MAX_AUDIO_INPUT_BYTES = 20 * 1024 * 1024
+MAX_INLINE_AUDIO_BYTES = 2 * 1024 * 1024
 MAX_AUDIO_SECONDS = 300
+MAX_AUDIO_RESPONSE_BYTES = 4 * 1024 * 1024
+MAX_DOCUMENT_INPUT_BYTES = 8 * 1024 * 1024
+MAX_DOCUMENT_TEXT_CHARS = 6_000
+MAX_DOCUMENT_PAGES = 100
+PDF_WORKER_TIMEOUT_SECONDS = 30
+PDF_WORKER_OUTPUT_BYTES = 64 * 1024
+MAX_DOCUMENT_ARCHIVE_BYTES = 16 * 1024 * 1024
+MAX_DOCX_XML_BYTES = 4 * 1024 * 1024
 MAX_OUTBOUND_MEDIA_BYTES = 20 * 1024 * 1024
 MAX_OUTBOUND_PHOTO_BYTES = 8 * 1024 * 1024
 MAX_OUTBOUND_STICKER_BYTES = 512 * 1024
@@ -50,6 +63,20 @@ class ImageResult:
 
 
 @dataclass(frozen=True)
+class AudioResult:
+    data: bytes
+    mime_type: str
+
+
+@dataclass(frozen=True)
+class DocumentText:
+    text: str
+    document_type: str
+    pages: int | None = None
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
 class OutboundMediaFile:
     path: Path
     media_type: str
@@ -62,6 +89,163 @@ class OutboundMediaFile:
     height: int | None = None
     voice: bool = False
     has_audio: bool = False
+
+
+def _bounded_text(parts, max_chars: int) -> tuple[str, bool]:
+    text = "".join(parts)
+    return text[:max_chars], len(text) > max_chars
+
+
+def _extract_pdf_text(path: Path, max_chars: int) -> DocumentText:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        raise Denied("document_parser_unavailable") from None
+    try:
+        with path.open("rb") as source:
+            reader = PdfReader(source, strict=False)
+            if reader.is_encrypted:
+                raise Denied("document_encrypted")
+            page_count = len(reader.pages)
+            if page_count > MAX_DOCUMENT_PAGES:
+                raise Denied("document_too_many_pages")
+            parts, count, truncated = [], 0, False
+            for page in reader.pages:
+                value = page.extract_text() or ""
+                if not isinstance(value, str):
+                    raise Denied("document_parse_failed")
+                remaining = max_chars - count
+                if len(value) > remaining:
+                    parts.append(value[:remaining])
+                    truncated = True
+                    break
+                parts.append(value)
+                count += len(value)
+                if count < max_chars:
+                    parts.append("\n\n")
+                    count += 2
+                else:
+                    truncated = True
+                    break
+            text, extra = _bounded_text(parts, max_chars)
+            return DocumentText(text, "pdf", pages=page_count,
+                                truncated=truncated or extra)
+    except Denied:
+        raise
+    except Exception:
+        raise Denied("document_parse_failed") from None
+
+
+def _extract_docx_text(path: Path, max_chars: int) -> DocumentText:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+            if len(entries) > 2_048 or sum(entry.file_size for entry in entries) > MAX_DOCUMENT_ARCHIVE_BYTES:
+                raise Denied("document_too_large")
+            if any(entry.flag_bits & 0x1 or
+                   (entry.file_size > 1_048_576 and entry.file_size > max(entry.compress_size, 1) * 200)
+                   for entry in entries):
+                raise Denied("document_too_large")
+            try:
+                info = archive.getinfo("word/document.xml")
+            except KeyError:
+                raise Denied("unsupported_document_format") from None
+            if info.file_size > MAX_DOCX_XML_BYTES:
+                raise Denied("document_too_large")
+            with archive.open(info) as source:
+                xml = source.read(MAX_DOCX_XML_BYTES + 1)
+            if len(xml) > MAX_DOCX_XML_BYTES:
+                raise Denied("document_too_large")
+            # Let Expat recognize declarations in the XML's own encoding.
+            # A byte regex misses UTF-16/UTF-32 declarations.
+            def reject_declaration(*args):
+                raise Denied("document_parse_failed")
+            validator = expat.ParserCreate()
+            validator.StartDoctypeDeclHandler = reject_declaration
+            validator.EntityDeclHandler = reject_declaration
+            validator.ExternalEntityRefHandler = reject_declaration
+            validator.Parse(xml, True)
+            ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+            text_tag, paragraph_tag, tab_tag = ns + "t", ns + "p", ns + "tab"
+            break_tags = {ns + "br", ns + "cr"}
+            parts, count, truncated = [], 0, False
+            for _, element in ET.iterparse(BytesIO(xml), events=("end",)):
+                if element.tag == text_tag:
+                    value = element.text or ""
+                elif element.tag == tab_tag:
+                    value = "\t"
+                elif element.tag in break_tags or element.tag == paragraph_tag:
+                    value = "\n"
+                else:
+                    value = ""
+                if value:
+                    remaining = max_chars - count
+                    if len(value) > remaining:
+                        parts.append(value[:remaining])
+                        truncated = True
+                        break
+                    parts.append(value)
+                    count += len(value)
+                    if count >= max_chars:
+                        truncated = True
+                        break
+            return DocumentText("".join(parts), "docx", truncated=truncated)
+    except Denied:
+        raise
+    except Exception:
+        raise Denied("document_parse_failed") from None
+
+
+def _decode_text_document(data: bytes, declared_mime: str | None) -> str:
+    mime = (declared_mime or "").strip().lower().split(";", 1)[0]
+    if mime in {"application/pdf", "application/zip",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}:
+        raise Denied("document_mime_mismatch")
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            text = data.decode("utf-16")
+        except UnicodeDecodeError:
+            raise Denied("unsupported_document_format") from None
+    else:
+        try:
+            text = data.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            if not mime.startswith("text/"):
+                raise Denied("unsupported_document_format") from None
+            try:
+                text = data.decode("cp1251")
+            except UnicodeDecodeError:
+                raise Denied("unsupported_document_format") from None
+    if any(unicodedata.category(char) == "Cc" and char not in "\n\r\t\f" for char in text):
+        raise Denied("unsupported_document_format")
+    return text
+
+
+def extract_document_text(path: Path, *, declared_mime: str | None = None,
+                          max_chars: int = MAX_DOCUMENT_TEXT_CHARS) -> DocumentText:
+    """Extract bounded text locally from plain-text, DOCX, or text-based PDF files."""
+    try:
+        size = path.stat().st_size
+        if size <= 0:
+            raise Denied("document_empty")
+        if size > MAX_DOCUMENT_INPUT_BYTES:
+            raise Denied("document_too_large")
+        with path.open("rb") as source:
+            header = source.read(1024)
+        if b"%PDF-" in header:
+            return _extract_pdf_text(path, max_chars)
+        if header.startswith(b"PK\x03\x04"):
+            return _extract_docx_text(path, max_chars)
+        if not isinstance(declared_mime, str) or len(declared_mime) > 96:
+            declared_mime = None
+        data = path.read_bytes()
+        text = _decode_text_document(data, declared_mime)
+        clipped, truncated = _bounded_text([text], max_chars)
+        return DocumentText(clipped, "text", truncated=truncated)
+    except Denied:
+        raise
+    except OSError:
+        raise Denied("document_read_failed") from None
 
 
 def _utf16_units(value: str) -> int:
@@ -521,7 +705,6 @@ async def _run_bounded(argv, *, timeout=15, max_stdout=MAX_TRANSCRIPTION_RESPONS
             if not chunk:
                 return bytes(output)
             if len(output) + len(chunk) > max_stdout:
-                process.kill()
                 raise Denied("media_processing_overflow")
             output.extend(chunk)
 
