@@ -88,6 +88,12 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         b = await self.call("get_history", peer_id=42, limit=3, before_id=a["next_before_id"])
         self.assertEqual([m["message_id"] for m in b["messages"]], [9, 8, 7])
         self.assertEqual(self.fake.history_calls[-1][2], 10)
+    async def test_message_results_expose_media_type_without_fetching_attachment(self):
+        self.fake.items = [msg(4, has_media=True, media_type="voice")]
+        result = await self.call("get_history", peer_id=42, limit=1)
+        self.assertEqual(result["messages"][0]["media_type"], "voice")
+        self.assertEqual(result["messages"][0]["has_media"], True)
+        self.fake.download_media.assert_not_awaited()
     async def test_search_pagination_and_empty(self):
         a = await self.call("search_messages", peer_id=42, query="caption", limit=5)
         b = await self.call("search_messages", peer_id=42, query="caption", limit=50, before_id=a["next_before_id"])

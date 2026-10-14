@@ -5,27 +5,33 @@ import asyncio
 import json
 import math
 import secrets
+import sys
 import time
 from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
 
 from .security import Denied, Policy, Quotas, RateGate, integer, peer_id as validate_peer_id
-from .media import (ImageResult, MAX_AUDIO_INPUT_BYTES, MAX_IMAGE_PREVIEW_BYTES,
-                    MAX_IMAGE_INPUT_BYTES, MAX_MEDIA_RESPONSE_BYTES, MEDIA_TIMEOUT_SECONDS, MediaCache,
+from .media import (AudioResult, ImageResult, MAX_AUDIO_INPUT_BYTES, MAX_INLINE_AUDIO_BYTES,
+                    MAX_AUDIO_RESPONSE_BYTES, MAX_IMAGE_PREVIEW_BYTES, MAX_IMAGE_INPUT_BYTES,
+                    MAX_DOCUMENT_INPUT_BYTES, MAX_DOCUMENT_TEXT_CHARS, MAX_MEDIA_RESPONSE_BYTES,
+                    MEDIA_TIMEOUT_SECONDS, MediaCache, DocumentText,
+                    PDF_WORKER_OUTPUT_BYTES, PDF_WORKER_TIMEOUT_SECONDS,
                     MAX_TRANSCRIPT_CHARS, TranscriptionConfig, prepare_audio, preview_image,
-                    sniff_audio_kind, temporary_media_dir, prepare_outbound_media,
-                    MAX_OUTBOUND_ITEMS, MAX_OUTBOUND_MEDIA_BYTES)
+                    sniff_audio_kind, extract_document_text, temporary_media_dir, prepare_outbound_media,
+                    MAX_OUTBOUND_ITEMS, MAX_OUTBOUND_MEDIA_BYTES, _run_bounded)
 
 SCOPES: ContextVar[frozenset[str]] = ContextVar("telegram_assistant_scopes", default=frozenset())
 MAX_BYTES = 48 * 1024
 MEDIA_SEND_TIMEOUT_SECONDS = 120
 READ_OPERATIONS = frozenset({
     "list_dialogs", "get_history", "search_messages", "get_reply_context",
-    "list_forum_topics", "get_forum_topic", "scan_updates", "view_photo", "transcribe_audio",
+    "list_forum_topics", "get_forum_topic", "scan_updates", "view_photo", "get_audio",
+    "read_document", "transcribe_audio",
 })
 WRITE_OPERATIONS = frozenset({"send_message", "send_media"})
 SUPPORTED_OPERATIONS = READ_OPERATIONS | WRITE_OPERATIONS
+MEDIA_OPERATIONS = frozenset({"view_photo", "get_audio", "read_document", "transcribe_audio"})
 
 
 def clip(value, limit=200):
@@ -83,13 +89,20 @@ class Service:
             try:
                 self.gate.check(count_local=operation not in READ_OPERATIONS)
                 timeout = (MEDIA_SEND_TIMEOUT_SECONDS if operation == "send_media" else
-                           MEDIA_TIMEOUT_SECONDS if operation in {"view_photo", "transcribe_audio"} else 20)
+                           MEDIA_TIMEOUT_SECONDS if operation in MEDIA_OPERATIONS else 20)
                 result = await asyncio.wait_for(getattr(self, operation)(*args, **kwargs), timeout)
                 if isinstance(result, ImageResult):
                     if (not isinstance(result.data, bytes) or result.mime_type != "image/jpeg" or
                             len(result.data) > MAX_IMAGE_PREVIEW_BYTES or
                             ((len(result.data) + 2) // 3) * 4 + 8192 > MAX_MEDIA_RESPONSE_BYTES):
                         raise Denied("image_preview_too_large")
+                    return result
+                if isinstance(result, AudioResult):
+                    if (not isinstance(result.data, bytes) or len(result.data) > MAX_INLINE_AUDIO_BYTES or
+                            result.mime_type not in {"audio/ogg", "audio/mpeg", "audio/mp4",
+                                                     "audio/wav", "audio/webm"} or
+                            ((len(result.data) + 2) // 3) * 4 + 8192 > MAX_AUDIO_RESPONSE_BYTES):
+                        raise Denied("audio_response_too_large")
                     return result
                 return bounded(result)
             except Denied as exc:
@@ -100,7 +113,7 @@ class Service:
             except TimeoutError:
                 return {"error": ("delivery_unknown" if self._send_attempted else "send_preflight_unavailable")
                         if operation in {"send_message", "send_media"} else
-                        ("media_timeout" if operation in {"view_photo", "transcribe_audio"} else "telegram_timeout")}
+                        ("media_timeout" if operation in MEDIA_OPERATIONS else "telegram_timeout")}
             except Exception as exc:
                 # Inspect structured flood fields only; never return/log repr or args.
                 if type(exc).__name__ in {"FloodWaitError", "SlowModeWaitError", "FloodPremiumWaitError"}:
@@ -118,7 +131,7 @@ class Service:
                         return {"error": "telegram_address_invalid"}
                 return {"error": ("delivery_unknown" if self._send_attempted else "send_preflight_unavailable")
                         if operation in {"send_message", "send_media"} else
-                        ("media_unavailable" if operation in {"view_photo", "transcribe_audio"} else "telegram_unavailable")}
+                        ("media_unavailable" if operation in MEDIA_OPERATIONS else "telegram_unavailable")}
 
     async def view_photo(self, peer_id, message_id):
         integer(message_id, 1, 2**31 - 1)
@@ -137,6 +150,74 @@ class Service:
             result = await preview_image(path)
         self.media_cache.put(key, result)
         return result
+
+    async def get_audio(self, peer_id, message_id):
+        integer(message_id, 1, 2**31 - 1)
+        target = await self._resolve(peer_id, allow_broadcast=True)
+        fetch = getattr(self.backend, "fetch_media_file", None)
+        if fetch is None:
+            raise Denied("media_unavailable")
+        with temporary_media_dir() as directory:
+            source = Path(directory) / "telegram-audio"
+            metadata = await fetch(target, message_id, kind="audio", destination=source,
+                                   max_bytes=MAX_INLINE_AUDIO_BYTES)
+            kind = sniff_audio_kind(source)
+            declared_mime = metadata.get("declared_mime") if isinstance(metadata, dict) else None
+            self._check_audio_mime(kind, declared_mime)
+            mime_type = {"ogg-opus": "audio/ogg", "mp3": "audio/mpeg", "mp4": "audio/mp4",
+                         "wav": "audio/wav", "webm": "audio/webm"}[kind]
+            return AudioResult(source.read_bytes(), mime_type)
+
+    async def read_document(self, peer_id, message_id):
+        integer(message_id, 1, 2**31 - 1)
+        target = await self._resolve(peer_id, allow_broadcast=True)
+        fetch = getattr(self.backend, "fetch_media_file", None)
+        if fetch is None:
+            raise Denied("media_unavailable")
+        with temporary_media_dir() as directory:
+            source = Path(directory) / "telegram-document"
+            metadata = await fetch(target, message_id, kind="document", destination=source,
+                                  max_bytes=MAX_DOCUMENT_INPUT_BYTES)
+            declared_mime = metadata.get("declared_mime") if isinstance(metadata, dict) else None
+            with source.open("rb") as downloaded:
+                is_pdf = b"%PDF-" in downloaded.read(1024)
+            if is_pdf:
+                document = await self._extract_pdf_in_worker(source)
+            else:
+                document = await asyncio.to_thread(
+                    extract_document_text, source, declared_mime=declared_mime)
+        return {"peer_id": target, "message_id": message_id,
+                "document_type": document.document_type, "pages": document.pages,
+                "text": document.text, "text_available": bool(document.text.strip()),
+                "text_truncated": document.truncated, "untrusted_content": True}
+
+    @staticmethod
+    async def _extract_pdf_in_worker(path):
+        try:
+            stdout = await _run_bounded(
+                [sys.executable, "-m", "telegram_assistant.pdf_worker", str(path)],
+                timeout=PDF_WORKER_TIMEOUT_SECONDS, max_stdout=PDF_WORKER_OUTPUT_BYTES)
+        except Denied as exc:
+            code = {"media_processor_unavailable": "document_parser_unavailable",
+                    "media_processing_timeout": "document_parse_timeout"}.get(
+                        exc.code, "document_parse_failed")
+            raise Denied(code) from None
+        try:
+            result = json.loads(stdout)
+        except (ValueError, UnicodeError):
+            raise Denied("document_parse_failed") from None
+        if not isinstance(result, dict):
+            raise Denied("document_parse_failed")
+        error = result.get("error")
+        if isinstance(error, str) and error in {
+                "document_encrypted", "document_too_many_pages", "document_parser_unavailable",
+                "document_parse_failed", "document_isolation_unavailable"}:
+            raise Denied(error)
+        text, pages, truncated = result.get("text"), result.get("pages"), result.get("truncated")
+        if (not isinstance(text, str) or len(text) > MAX_DOCUMENT_TEXT_CHARS or type(pages) is not int or
+                not 0 <= pages <= 100 or type(truncated) is not bool):
+            raise Denied("document_parse_failed")
+        return DocumentText(text, "pdf", pages=pages, truncated=truncated)
 
     @staticmethod
     def _check_audio_mime(kind, declared_mime):
@@ -487,7 +568,8 @@ class Service:
         sender = message.get("sender_id")
         return {"peer_id": target, "message_id": message["id"], "sender_id": sender,
                 "date": message.get("date"), "text": text, "text_truncated": truncated,
-                "has_media": bool(message.get("has_media")), "reply_to": message.get("reply_to"),
+                "has_media": bool(message.get("has_media")), "media_type": message.get("media_type"),
+                "reply_to": message.get("reply_to"),
                 "topic_id": message.get("topic_id"),
                 "reply_peer_id": message.get("reply_peer_id"), "out": bool(message.get("out", False))}
 

@@ -305,6 +305,28 @@ class TelethonBackend:
                 not getattr(first, "out", True) and getattr(first, "sender_id", None) == entity.id)
 
     @staticmethod
+    def media_type(message):
+        """Return a small, non-content media category for message discovery."""
+        if getattr(message, "photo", None) is not None:
+            return "photo"
+        document = getattr(message, "document", None)
+        if document is not None:
+            attributes = list(getattr(document, "attributes", ()) or ())
+            names = {type(attribute).__name__ for attribute in attributes}
+            if "DocumentAttributeSticker" in names:
+                return "sticker"
+            if "DocumentAttributeAnimated" in names:
+                return "animation"
+            if "DocumentAttributeVideo" in names:
+                return "video"
+            audio = next((attribute for attribute in attributes
+                          if type(attribute).__name__ == "DocumentAttributeAudio"), None)
+            if audio is not None:
+                return "voice" if bool(getattr(audio, "voice", False)) else "audio"
+            return "document"
+        return "other" if getattr(message, "media", None) is not None else None
+
+    @staticmethod
     def record(message):
         from telethon.utils import get_peer_id
         reply = getattr(message, "reply_to", None)
@@ -312,6 +334,7 @@ class TelethonBackend:
         return {"id": message.id, "text": getattr(message, "message", "") or "",
                 "date": message.date.isoformat() if message.date else None,
                 "sender_id": message.sender_id, "has_media": message.media is not None,
+                "media_type": TelethonBackend.media_type(message),
                 "out": bool(getattr(message, "out", False)),
                 "reply_to": getattr(reply, "reply_to_msg_id", None),
                 "topic_id": getattr(reply, "reply_to_top_id", None),
@@ -436,7 +459,7 @@ class TelethonBackend:
         return self.record(message) if message else None
 
     async def fetch_media_file(self, target, message_id, *, kind, destination, max_bytes):
-        """Fetch only one explicitly requested photo/audio attachment to a bounded file."""
+        """Fetch one explicitly requested photo/audio/document attachment to a bounded file."""
         from math import ceil
         from telethon import types
         from .media import MAX_IMAGE_PIXELS
@@ -448,7 +471,7 @@ class TelethonBackend:
 
         declared_mime = None
         declared_duration = None
-        if kind == "photo" and getattr(message, "photo", None) is not None:
+        if kind == "photo" and self.media_type(message) == "photo":
             photo = message.photo
             candidates = []
             for size in getattr(photo, "sizes", ()) or ():
@@ -490,6 +513,16 @@ class TelethonBackend:
             metadata = {"kind": "audio", "size": declared_size,
                         "declared_mime": declared_mime, "declared_duration": declared_duration,
                         "voice": bool(getattr(audio_attribute, "voice", False))}
+        elif kind == "document" and self.media_type(message) == "document":
+            document = message.document
+            declared_size = getattr(document, "size", None)
+            if type(declared_size) is not int or declared_size <= 0:
+                raise Denied("document_too_large")
+            if declared_size > max_bytes:
+                raise Denied("document_too_large")
+            location = document
+            metadata = {"kind": "document", "size": declared_size,
+                        "declared_mime": getattr(document, "mime_type", None)}
         else:
             raise Denied("media_type_unsupported")
 
