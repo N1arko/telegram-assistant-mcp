@@ -25,6 +25,7 @@ from .media import (AudioResult, ImageResult, MAX_AUDIO_INPUT_BYTES, MAX_INLINE_
 
 SCOPES: ContextVar[frozenset[str]] = ContextVar("telegram_assistant_scopes", default=frozenset())
 MAX_BYTES = 48 * 1024
+EXACT_POST_TEXT_CHARS = 4000
 MEDIA_SEND_TIMEOUT_SECONDS = 120
 READ_OPERATIONS = frozenset({
     "list_dialogs", "get_history", "search_messages", "get_reply_context",
@@ -624,15 +625,33 @@ class Service:
         return bounded(payload)
 
     @staticmethod
-    def _record(message, target):
-        text, truncated = clip(message["text"], 2000)
+    def _record(message, target, *, exact_text_offset=None):
+        if exact_text_offset is None:
+            text, truncated = clip(message["text"], 2000)
+        else:
+            full_text = str(message.get("text") or "")
+            if exact_text_offset > len(full_text):
+                raise Denied("invalid_text_offset")
+            end = min(len(full_text), exact_text_offset + EXACT_POST_TEXT_CHARS)
+            text = full_text[exact_text_offset:end]
+            # `text_complete` means this single response contains the whole
+            # post, starting at offset zero. `text_next_offset` independently
+            # indicates whether another chunk remains.
+            complete_text = exact_text_offset == 0 and end == len(full_text)
+            truncated = not complete_text
         sender = message.get("sender_id")
-        return {"peer_id": target, "message_id": message["id"], "sender_id": sender,
-                "date": message.get("date"), "text": text, "text_truncated": truncated,
-                "has_media": bool(message.get("has_media")), "media_type": message.get("media_type"),
-                "reply_to": message.get("reply_to"),
-                "topic_id": message.get("topic_id"),
-                "reply_peer_id": message.get("reply_peer_id"), "out": bool(message.get("out", False))}
+        record = {"peer_id": target, "message_id": message["id"], "sender_id": sender,
+                  "date": message.get("date"), "text": text, "text_truncated": truncated,
+                  "has_media": bool(message.get("has_media")), "media_type": message.get("media_type"),
+                  "reply_to": message.get("reply_to"),
+                  "topic_id": message.get("topic_id"),
+                  "reply_peer_id": message.get("reply_peer_id"), "out": bool(message.get("out", False))}
+        if exact_text_offset is not None:
+            record.update({"text_offset": exact_text_offset,
+                           "text_complete": complete_text,
+                           "text_next_offset": end if end < len(full_text) else None,
+                           "text_total_chars": len(full_text)})
+        return record
 
     async def get_forum_topic(self, peer_id, topic_id):
         integer(topic_id, 1, 2**31 - 1)
@@ -727,7 +746,7 @@ class Service:
             raise Denied("invalid_query")
         return await self._messages(peer_id, limit, before_id, query=query)
 
-    async def read_channel(self, reference, limit=20, before_id=None):
+    async def read_channel(self, reference, limit=20, before_id=None, text_offset=0):
         """Read one explicitly named public broadcast channel without listing/joining it."""
         if "telegram:read" not in SCOPES.get():
             raise Denied("unauthorized")
@@ -736,7 +755,10 @@ class Service:
         integer(limit, 1, 50)
         if before_id is not None:
             integer(before_id, 1, 2**31 - 1)
+        integer(text_offset, 0, 2**31 - 1)
         username, post_id = parse_channel_reference(reference)
+        if post_id is None and text_offset:
+            raise Denied("invalid_argument")
         resolve = getattr(self.backend, "resolve_public_channel", None)
         if resolve is None:
             raise Denied("channel_read_unavailable")
@@ -761,7 +783,8 @@ class Service:
                 raise Denied("message_missing")
             payload = {"peer_id": target, "username": actual_username, "title": title,
                        "title_truncated": title_truncated,
-                       "messages": [self._record(message, target)], "next_before_id": None,
+                       "messages": [self._record(message, target, exact_text_offset=text_offset)],
+                       "next_before_id": None,
                        "complete": True, "incomplete": False, "exact_post": True,
                        "untrusted_content": True, "order": "message_id_desc"}
             return payload

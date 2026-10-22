@@ -58,6 +58,7 @@ class OptInTargetedChannelReadTests(unittest.IsolatedAsyncioTestCase):
         tools = response.json()['result']['tools']
         entry = next(tool for tool in tools if tool['name'] == 'read_channel')
         self.assertTrue(entry['annotations']['readOnlyHint'])
+        self.assertIn('text_offset', entry['inputSchema']['properties'])
         listing = next(tool for tool in tools if tool['name'] == 'list_public_channels')
         self.assertTrue(listing['annotations']['readOnlyHint'])
         self.assertEqual(listing.get('_meta'), entry.get('_meta'))

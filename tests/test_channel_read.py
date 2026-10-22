@@ -17,8 +17,8 @@ def public_channel(channel_id=2206439398, username="niar42", *, broadcast=True, 
                          megagroup=megagroup, gigagroup=False, username=username)
 
 
-def message(message_id):
-    return SimpleNamespace(id=message_id, message=f"post {message_id}",
+def message(message_id, text=None):
+    return SimpleNamespace(id=message_id, message=text if text is not None else f"post {message_id}",
                            date=datetime(2026, 10, 22, tzinfo=timezone.utc),
                            sender_id=None, media=None, reply_to=None, photo=None,
                            document=None, out=False)
@@ -106,6 +106,110 @@ class OnDemandChannelReadTests(unittest.IsolatedAsyncioTestCase):
         # Client intentionally has no generic RPC method: resolver must not use
         # GetPeerDialogs or any join API for this explicit public read.
         self.assertEqual(len(client.message_calls), 1)
+
+    async def test_long_exact_post_returns_bounded_chunks_with_text_cursor(self):
+        channel = public_channel()
+        full_text = "a" * 3998 + "🙂" * 5 + "tail"
+
+        class Client:
+            get_entity = AsyncMock(return_value=channel)
+
+            def __init__(self):
+                self.message_calls = []
+
+            async def get_messages(self, entity, **kwargs):
+                self.message_calls.append((entity, kwargs))
+                return message(kwargs["ids"], full_text)
+
+        client = Client()
+        service = Service(TelethonBackend(client), gate=RateGate(limit=1000),
+                          targeted_channel_reads_enabled=True)
+        reference = "https://t.me/niar42/81"
+        first = await service.invoke("read_channel", reference=reference)
+        first_post = first["messages"][0]
+        self.assertTrue(first["complete"])
+        self.assertFalse(first["incomplete"])
+        self.assertTrue(first["exact_post"])
+        self.assertFalse(first_post["text_complete"])
+        self.assertTrue(first_post["text_truncated"])
+        self.assertEqual(first_post["text_offset"], 0)
+        self.assertEqual(len(first_post["text"]), 4000)
+        self.assertEqual(first_post["text_next_offset"], 4000)
+        self.assertEqual(first_post["text_total_chars"], len(full_text))
+
+        second = await service.invoke("read_channel", reference=reference,
+                                      text_offset=first_post["text_next_offset"])
+        second_post = second["messages"][0]
+        self.assertTrue(second["complete"])
+        self.assertFalse(second["incomplete"])
+        self.assertFalse(second_post["text_complete"])
+        self.assertTrue(second_post["text_truncated"])
+        self.assertEqual(second_post["text_offset"], 4000)
+        self.assertEqual(second_post["text_next_offset"], None)
+        self.assertEqual(first_post["text"] + second_post["text"], full_text)
+        self.assertEqual(len(client.message_calls), 2)
+        self.assertEqual([call[1] for call in client.message_calls], [{"ids": 81}, {"ids": 81}])
+
+    async def test_short_exact_post_is_text_complete_and_offset_is_post_only(self):
+        channel = public_channel()
+
+        class Client:
+            get_entity = AsyncMock(return_value=channel)
+
+            async def get_messages(self, entity, **kwargs):
+                if "ids" in kwargs:
+                    return message(kwargs["ids"], "short body")
+                return [message(81, "x" * 2500)]
+
+        client = Client()
+        service = Service(TelethonBackend(client), gate=RateGate(limit=1000),
+                          targeted_channel_reads_enabled=True)
+        exact = await service.invoke("read_channel", reference="https://t.me/niar42/81")
+        post = exact["messages"][0]
+        self.assertTrue(post["text_complete"])
+        self.assertFalse(post["text_truncated"])
+        self.assertIsNone(post["text_next_offset"])
+        self.assertEqual(post["text"], "short body")
+
+        history = await service.invoke("read_channel", reference="@niar42", limit=1)
+        history_post = history["messages"][0]
+        self.assertEqual(history_post["text"], "x" * 2000)
+        self.assertTrue(history_post["text_truncated"])
+        self.assertNotIn("text_complete", history_post)
+        invalid = await service.invoke("read_channel", reference="@niar42", text_offset=1)
+        self.assertEqual(invalid, {"error": "invalid_argument"})
+
+    async def test_exact_post_text_offset_is_bounded_by_actual_text(self):
+        channel = public_channel()
+
+        class Client:
+            get_entity = AsyncMock(return_value=channel)
+
+            async def get_messages(self, entity, **kwargs):
+                return message(kwargs["ids"], "short")
+
+        service = Service(TelethonBackend(Client()), gate=RateGate(limit=1000),
+                          targeted_channel_reads_enabled=True)
+        result = await service.invoke("read_channel", reference="https://t.me/niar42/81",
+                                      text_offset=6)
+        self.assertEqual(result, {"error": "invalid_text_offset"})
+
+    async def test_escaped_text_chunk_stays_inside_response_limit(self):
+        channel = public_channel()
+
+        class Client:
+            get_entity = AsyncMock(return_value=channel)
+
+            async def get_messages(self, entity, **kwargs):
+                return message(kwargs["ids"], "\x00" * 5001)
+
+        service = Service(TelethonBackend(Client()), gate=RateGate(limit=1000),
+                          targeted_channel_reads_enabled=True)
+        result = await service.invoke("read_channel", reference="https://t.me/niar42/81")
+        post = result["messages"][0]
+        self.assertEqual(len(post["text"]), 4000)
+        self.assertEqual(post["text_next_offset"], 4000)
+        self.assertFalse(post["text_complete"])
 
     async def test_gate_is_off_by_default_and_service_call_cannot_bypass_it(self):
         class Backend:

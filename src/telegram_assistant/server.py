@@ -267,9 +267,11 @@ def build_mcp(service, config, verifier, *, read_only=False):
     if service.targeted_channel_reads_enabled:
         @mcp.tool(annotations=read, meta=schemes)
         async def read_channel(reference: StrictText, limit: StrictID = 20,
-                               before_id: StrictID | None = None) -> CallToolResult:
-            """Read one public broadcast channel named by @username or a t.me link. Default page: 20 posts; maximum: 50. A post URL returns only that exact post. Continue channel pages with next_before_id; check complete/incomplete. Does not join, mark read, or monitor channels; private invite links are unsupported."""
-            return await call("read_channel", reference=reference, limit=limit, before_id=before_id)
+                               before_id: StrictID | None = None,
+                               text_offset: StrictID = 0) -> CallToolResult:
+            """Read one public broadcast channel named by @username or a t.me link. Default page: 20 posts; maximum: 50. A post URL returns only that exact post. For long posts, text_offset fetches the next 4,000-character text chunk; use text_next_offset until null. `complete` describes the post/page fetch, while each exact post's `text_complete` means its full text is present in that response. Does not join, mark read, or monitor channels; private invite links are unsupported."""
+            return await call("read_channel", reference=reference, limit=limit,
+                              before_id=before_id, text_offset=text_offset)
 
         @mcp.tool(annotations=read, meta=schemes)
         async def list_public_channels(limit: StrictID = 20,
