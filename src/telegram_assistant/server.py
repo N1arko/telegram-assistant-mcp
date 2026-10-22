@@ -39,8 +39,9 @@ class OutboundMediaInput(BaseModel):
 
 MediaItems = Annotated[list[OutboundMediaInput], Field(min_length=1, max_length=10)]
 
-# The only permitted broadcast-channel read exception is populated with the
-# session-verified (marked peer ID, username) pair. None keeps v1 behavior.
+# Existing dialog-based reads may expose one session-verified owner channel.
+# This does not configure recurring monitoring; read_channel is a separate
+# one-off public-target path and does not change the dialog catalogue.
 READ_ONLY_BROADCAST_CHANNEL = None
 
 from .auth import AuthConfig, JWKSVerifier, https_url
@@ -212,7 +213,10 @@ def build_mcp(service, config, verifier, *, read_only=False):
                       "do not retry get_audio or claim to have heard it. Use authorized transcribe_audio or explain the limitation. "
                       "Server policy is only an additional technical barrier. Never retry delivery_unknown automatically. "
                       "Make Telegram calls sequentially. Stop until retry_after_seconds after a rate limit. "
-                      "Broadcast reads are limited to an explicitly configured, creator-verified owner channel."),
+                      "read_channel is disabled by default; when explicitly enabled, it is a one-off, bounded read "
+                      "of one named public broadcast channel or exact public post; "
+                      "it never joins, marks read, or adds channels to list_dialogs or scan_updates. "
+                      "Broadcast reads through other tools remain limited to an explicitly configured, creator-verified owner channel."),
         auth=AuthSettings(issuer_url=config.issuer, resource_server_url=config.resource,
                           required_scopes=["telegram:read"]), token_verifier=verifier,
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=True,
@@ -258,6 +262,13 @@ def build_mcp(service, config, verifier, *, read_only=False):
     async def search_messages(peer_id: StrictID, query: StrictText, limit: StrictID = 20, before_id: StrictID | None = None) -> CallToolResult:
         """Search text within a known allowed dialog or explicitly allowlisted owner channel; results include has_media and media_type labels but never download attachments. Continue via next_before_id. No public search."""
         return await call("search_messages", peer_id=peer_id, query=query, limit=limit, before_id=before_id)
+
+    if service.targeted_channel_reads_enabled:
+        @mcp.tool(annotations=read, meta=schemes)
+        async def read_channel(reference: StrictText, limit: StrictID = 20,
+                               before_id: StrictID | None = None) -> CallToolResult:
+            """Read one public broadcast channel named by @username or a t.me link. Default page: 20 posts; maximum: 50. A post URL returns only that exact post. Continue channel pages with next_before_id; check complete/incomplete. Does not join, mark read, list, or monitor channels; private invite links are unsupported."""
+            return await call("read_channel", reference=reference, limit=limit, before_id=before_id)
 
     @mcp.tool(annotations=read, meta=schemes)
     async def get_reply_context(peer_id: StrictID, message_id: StrictID, radius: StrictID = 3) -> CallToolResult:
@@ -546,6 +557,7 @@ async def serve(args):
             Policy.load(args.policy), quotas,
             gate=RateGate(storage=quotas, startup_grace=60),
             read_only_broadcast_channel=READ_ONLY_BROADCAST_CHANNEL,
+            targeted_channel_reads_enabled=getattr(args, "enable_targeted_channel_reads", False),
             transcription=transcription, transcriber=transcriber)
         read_only = getattr(args, "read_only", False)
         mcp = build_mcp(service, auth, verifier, read_only=read_only)
@@ -572,6 +584,8 @@ def main():
                         help="bootstrap serves public OAuth metadata and rejects every MCP request")
     parser.add_argument("--container-network", action="store_true", help="Bind inside isolated Docker network; never publish backend ports")
     parser.add_argument("--read-only", action="store_true", help="Expose read tools only and advertise only telegram:read")
+    parser.add_argument("--enable-targeted-channel-reads", action="store_true",
+                        help="Explicitly enable bounded reads of named public channels (disabled by default)")
     parser.add_argument("--bootstrap-config", type=Path)
     parser.add_argument("--auth-config", type=Path)
     parser.add_argument("--telegram-config", type=Path)
@@ -592,7 +606,8 @@ def main():
         if (args.read_only or args.bootstrap_config is None or
                 any((args.auth_config, args.telegram_config, args.policy, args.runtime_dir)) or
                 args.auth_diagnostics_until_epoch is not None or
-                args.transcription_provider != "off" or args.transcription_key_file):
+                args.transcription_provider != "off" or args.transcription_key_file or
+                args.enable_targeted_channel_reads):
             parser.error("bootstrap requires --bootstrap-config and forbids live configuration arguments")
     else:
         if args.bootstrap_config is not None or any(x is None for x in

@@ -299,7 +299,10 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
             client.is_user_authorized = AsyncMock(return_value=True)
             client.get_me = AsyncMock(return_value=types.User(id=42,bot=False))
             captured = {}
-            def build(service,*args,**kwargs): captured['service'] = service;return object()
+            def build(service,*args,**kwargs):
+                captured['service'] = service
+                self.assertTrue(service.targeted_channel_reads_enabled)
+                return object()
             class Server:
                 def __init__(self,*args): pass
                 async def serve(inner):
@@ -326,7 +329,7 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(len(client.requests),1)
             args = SimpleNamespace(auth_config=root/'auth.json',telegram_config=config,
                                    runtime_dir=root/'state',policy=root/'no-policy',read_only=True,
-                                   container_network=True)
+                                   container_network=True,enable_targeted_channel_reads=True)
             verifier = SimpleNamespace(close=AsyncMock(), start_background_refresh=Mock())
             with patch('telegram_assistant.server.AuthConfig.load',return_value=CONFIG), \
                  patch('telethon.TelegramClient',return_value=client), \

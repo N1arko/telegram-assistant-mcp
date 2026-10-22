@@ -183,6 +183,12 @@ class ServiceChannelGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row['type'] for row in result['dialogs']],
                          ['user', 'group', 'channel'])
 
+    async def test_regular_monitor_catalogue_never_inherits_owner_channel_allowlist(self):
+        result = await self.service.list_dialogs(limit=50, _monitor_metadata=True)
+        self.assertEqual([row['peer_id'] for row in result['dialogs']], [42, -77])
+        self.assertNotIn(self.allowed_peer_id,
+                         [row['peer_id'] for row in result['dialogs']])
+
     async def test_reads_allow_exact_channel_but_no_other_broadcast(self):
         for peer_id in (42, -77, self.allowed_peer_id):
             result = await self.service.invoke('get_history', peer_id=peer_id, limit=1)

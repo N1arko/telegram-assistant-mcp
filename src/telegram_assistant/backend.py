@@ -443,6 +443,35 @@ class TelethonBackend:
         result = await self.client.get_messages(self.peers[target], **kwargs)
         return [self.record(m) for m in result if m is not None]
 
+    async def resolve_public_channel(self, username):
+        """Resolve one exact public username; never joins or lists dialogs."""
+        from telethon import types
+        from telethon.utils import get_peer_id
+
+        await self.activate()
+        try:
+            entity = await self.client.get_entity(f"@{username}")
+        except ValueError:
+            raise Denied("channel_not_found") from None
+        except Exception as exc:
+            name = type(exc).__name__
+            if name in {"UsernameInvalidError", "UsernameNotOccupiedError", "ChannelInvalidError"}:
+                raise Denied("channel_not_found") from None
+            if name in {"ChannelPrivateError", "ChannelPublicGroupNaError"}:
+                raise Denied("channel_not_accessible") from None
+            raise
+
+        if not isinstance(entity, types.Channel) or self.kind(entity) != "broadcast_channel":
+            raise Denied("target_not_broadcast_channel")
+        actual_username = getattr(entity, "username", None)
+        if not isinstance(actual_username, str) or actual_username.casefold() != username.casefold():
+            raise Denied("peer_mismatch")
+        target = get_peer_id(entity)
+        if self._remember(entity) != target:
+            raise Denied("peer_mismatch")
+        return {"peer_id": target, "username": actual_username,
+                "title": getattr(entity, "title", "") or ""}
+
     async def new_messages(self, target, *, after_id, through_id, limit):
         """Fetch a bounded oldest-first page inside a fixed message-ID range."""
         await self.activate()

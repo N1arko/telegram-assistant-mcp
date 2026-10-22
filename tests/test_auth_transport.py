@@ -189,7 +189,8 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             self.jwks_calls+=1
             return httpx.Response(200,json={"keys":[jwk()]})
         self.verifier=JWKSVerifier(CONFIG,http=httpx.AsyncClient(transport=httpx.MockTransport(fetch_keys)))
-        self.service=Service(self.fake)
+        self.service=Service(self.fake,
+            targeted_channel_reads_enabled=getattr(self,"targeted_channel_reads_enabled",False))
         self.mcp=build_mcp(self.service,CONFIG,self.verifier,read_only=getattr(self,"read_only",False))
         self.app=build_app(self.mcp,CONFIG,read_only=getattr(self,"read_only",False))
         self.ready = asyncio.Event()

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Add an opt-in, bounded read path for one explicitly named public broadcast channel or exact public post. Its gate is off by default; reads stay separate from dialog listing and recurring chat scans, and never join or acknowledge posts.
+
 ## 0.1.2 — 2026-10-14
 
 ### Added

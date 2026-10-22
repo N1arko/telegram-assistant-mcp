@@ -21,6 +21,7 @@ class ReadOnlyTransportTests(unittest.IsolatedAsyncioTestCase):
         {'list_dialogs','scan_updates','get_history','search_messages','get_reply_context',
          'list_forum_topics','get_forum_topic','view_photo','get_audio','read_document',
          'transcribe_audio'})
+        self.assertNotIn('read_channel', {t['name'] for t in tools})
         self.assertTrue(all(t['annotations']['readOnlyHint'] for t in tools))
 
     async def test_both_send_tools_absent_even_for_valid_owner_with_write_scope(self):
@@ -42,3 +43,19 @@ class ReadOnlyTransportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status_code,401)
             self.assertIn('resource_metadata',response.headers['www-authenticate'])
         self.fake.history.assert_not_awaited()
+
+
+class OptInTargetedChannelReadTests(unittest.IsolatedAsyncioTestCase):
+    read_only = True
+    targeted_channel_reads_enabled = True
+    asyncSetUp = base.TransportTests.asyncSetUp
+    asyncTearDown = base.TransportTests.asyncTearDown
+    rpc = base.TransportTests.rpc
+
+    async def test_channel_tool_is_registered_only_when_gate_is_enabled(self):
+        response = await self.rpc('tools/list')
+        tools = response.json()['result']['tools']
+        entry = next(tool for tool in tools if tool['name'] == 'read_channel')
+        self.assertTrue(entry['annotations']['readOnlyHint'])
+        self.assertNotIn('send_message', {tool['name'] for tool in tools})
+        self.assertNotIn('send_media', {tool['name'] for tool in tools})

@@ -4,12 +4,14 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import re
 import secrets
 import sys
 import time
 from collections import OrderedDict
 from contextvars import ContextVar
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .security import Denied, Policy, Quotas, RateGate, integer, peer_id as validate_peer_id
 from .media import (AudioResult, ImageResult, MAX_AUDIO_INPUT_BYTES, MAX_INLINE_AUDIO_BYTES,
@@ -27,11 +29,53 @@ MEDIA_SEND_TIMEOUT_SECONDS = 120
 READ_OPERATIONS = frozenset({
     "list_dialogs", "get_history", "search_messages", "get_reply_context",
     "list_forum_topics", "get_forum_topic", "scan_updates", "view_photo", "get_audio",
-    "read_document", "transcribe_audio",
+    "read_document", "transcribe_audio", "read_channel",
 })
 WRITE_OPERATIONS = frozenset({"send_message", "send_media"})
 SUPPORTED_OPERATIONS = READ_OPERATIONS | WRITE_OPERATIONS
 MEDIA_OPERATIONS = frozenset({"view_photo", "get_audio", "read_document", "transcribe_audio"})
+CHANNEL_USERNAME = re.compile(r"^[A-Za-z0-9_]{5,32}$", re.ASCII)
+
+
+def parse_channel_reference(reference):
+    """Accept one public @username or t.me post link; never resolve invite links."""
+    if not isinstance(reference, str) or len(reference) > 2048:
+        raise Denied("invalid_channel_reference")
+    value = reference.strip()
+    if not value:
+        raise Denied("invalid_channel_reference")
+
+    post_id = None
+    if "://" in value:
+        try:
+            parsed = urlsplit(value)
+            port = parsed.port
+        except ValueError:
+            raise Denied("invalid_channel_reference") from None
+        if (parsed.scheme != "https" or parsed.hostname not in {"t.me", "telegram.me"} or
+                parsed.username is not None or parsed.password is not None or port is not None or
+                parsed.fragment or parsed.query not in {"", "single"}):
+            raise Denied("invalid_channel_reference")
+        parts = parsed.path.strip("/").split("/")
+        if parts and parts[0] == "s":
+            parts = parts[1:]
+        if not parts or parts[0] in {"c", "joinchat"} or parts[0].startswith("+") or len(parts) > 2:
+            raise Denied("invalid_channel_reference")
+        username = parts[0]
+        if len(parts) == 2:
+            if not parts[1].isascii() or not parts[1].isdigit():
+                raise Denied("invalid_channel_reference")
+            post_id = int(parts[1])
+            if not 1 <= post_id < 2**31:
+                raise Denied("invalid_channel_reference")
+    else:
+        username = value[1:] if value.startswith("@") else value
+        if any(char in username for char in "/:?#[\\]@"):
+            raise Denied("invalid_channel_reference")
+
+    if not CHANNEL_USERNAME.fullmatch(username):
+        raise Denied("invalid_channel_reference")
+    return username, post_id
 
 
 def clip(value, limit=200):
@@ -62,6 +106,7 @@ def bounded(payload):
 class Service:
     def __init__(self, backend, policy: Policy | None = None, quotas: Quotas | None = None,
                  *, gate=None, clock=time.time, read_only_broadcast_channel=None,
+                 targeted_channel_reads_enabled=False,
                  transcription: TranscriptionConfig | None = None, transcriber=None,
                  media_cache=None):
         self.backend = backend
@@ -70,6 +115,9 @@ class Service:
         self.gate = gate or RateGate()
         self.clock = clock
         self.read_only_broadcast_channel = read_only_broadcast_channel
+        if type(targeted_channel_reads_enabled) is not bool:
+            raise ValueError("targeted_channel_reads_enabled must be a bool")
+        self.targeted_channel_reads_enabled = targeted_channel_reads_enabled
         self.transcription = transcription or TranscriptionConfig()
         self.transcriber = transcriber
         self.media_cache = media_cache or MediaCache()
@@ -84,6 +132,8 @@ class Service:
             return {"error": "unauthorized"}
         if operation not in SUPPORTED_OPERATIONS:
             return {"error": "unknown_tool"}
+        if operation == "read_channel" and not self.targeted_channel_reads_enabled:
+            return {"error": "channel_reads_disabled"}
         async with self.lock:
             self._send_attempted = False
             try:
@@ -120,6 +170,10 @@ class Service:
                     seconds = max(1, int(getattr(exc, "seconds", 60)))
                     self.gate.flood(seconds)
                     return {"error": "telegram_rate_limited", "retry_after_seconds": seconds}
+                if (operation == "read_channel" and type(exc).__name__ in {
+                        "ChannelPrivateError", "ChannelInvalidError", "PeerIdInvalidError",
+                        "UsernameInvalidError", "UsernameNotOccupiedError"}):
+                    return {"error": "channel_not_accessible"}
                 if operation in {"send_message", "send_media"}:
                     name = type(exc).__name__
                     if name in {"ChatWriteForbiddenError", "ChatAdminRequiredError",
@@ -354,6 +408,11 @@ class Service:
             for d in result['rows']:
                 configured_peer = d["peer_id"] == allowed_peer_id
                 is_owner_broadcast = configured_peer and d["type"] == "broadcast_channel"
+                # The recurring personal/work-chat scanner never inherits the
+                # one-off owner-channel exception. Channel monitoring requires
+                # a separate, explicit feature and allowlist.
+                if _monitor_metadata and is_owner_broadcast:
+                    continue
                 if ((configured_peer and not is_owner_broadcast) or
                         (d["type"] not in {"user", "group"} and not is_owner_broadcast) or
                         (archived is not None and d["archived"] != archived)):
@@ -665,6 +724,69 @@ class Service:
         if not isinstance(query, str) or not query.strip() or len(query) > 256:
             raise Denied("invalid_query")
         return await self._messages(peer_id, limit, before_id, query=query)
+
+    async def read_channel(self, reference, limit=20, before_id=None):
+        """Read one explicitly named public broadcast channel without listing/joining it."""
+        if "telegram:read" not in SCOPES.get():
+            raise Denied("unauthorized")
+        if not self.targeted_channel_reads_enabled:
+            raise Denied("channel_reads_disabled")
+        integer(limit, 1, 50)
+        if before_id is not None:
+            integer(before_id, 1, 2**31 - 1)
+        username, post_id = parse_channel_reference(reference)
+        resolve = getattr(self.backend, "resolve_public_channel", None)
+        if resolve is None:
+            raise Denied("channel_read_unavailable")
+        channel = await resolve(username)
+        if not isinstance(channel, dict):
+            raise Denied("channel_read_unavailable")
+        target = validate_peer_id(channel.get("peer_id"))
+        actual_username = channel.get("username")
+        title, title_truncated = clip(channel.get("title"), 120)
+        if (not isinstance(actual_username, str) or
+                actual_username.casefold() != username.casefold()):
+            raise Denied("peer_mismatch")
+
+        if post_id is not None:
+            if before_id is not None:
+                raise Denied("invalid_argument")
+            fetch = getattr(self.backend, "message", None)
+            if fetch is None:
+                raise Denied("channel_read_unavailable")
+            message = await fetch(target, post_id)
+            if not isinstance(message, dict) or message.get("id") != post_id:
+                raise Denied("message_missing")
+            payload = {"peer_id": target, "username": actual_username, "title": title,
+                       "title_truncated": title_truncated,
+                       "messages": [self._record(message, target)], "next_before_id": None,
+                       "complete": True, "incomplete": False, "exact_post": True,
+                       "untrusted_content": True, "order": "message_id_desc"}
+            return payload
+
+        fetch = getattr(self.backend, "history", None)
+        if fetch is None:
+            raise Denied("channel_read_unavailable")
+        messages = await fetch(target, limit=limit + 1, before_id=before_id, query=None)
+        if not isinstance(messages, (list, tuple)):
+            raise Denied("channel_read_unavailable")
+        messages = list(messages[:limit + 1])
+        records = [self._record(message, target) for message in messages]
+        has_more = len(records) > limit
+        records = records[:limit]
+        payload = {"peer_id": target, "username": actual_username, "title": title,
+                   "title_truncated": title_truncated, "messages": records,
+                   "next_before_id": None, "complete": not has_more, "incomplete": has_more,
+                   "exact_post": False, "untrusted_content": True,
+                   "order": "message_id_desc"}
+        while wire_size(payload) > MAX_BYTES - 64 and records:
+            records.pop()
+        has_more = len(messages) > len(records)
+        payload["incomplete"] = has_more
+        payload["complete"] = not has_more
+        if has_more and records:
+            payload["next_before_id"] = records[-1]["message_id"]
+        return payload
 
     async def get_reply_context(self, peer_id, message_id, radius=3):
         integer(message_id, 1, 2**31 - 1)
