@@ -29,7 +29,7 @@ MEDIA_SEND_TIMEOUT_SECONDS = 120
 READ_OPERATIONS = frozenset({
     "list_dialogs", "get_history", "search_messages", "get_reply_context",
     "list_forum_topics", "get_forum_topic", "scan_updates", "view_photo", "get_audio",
-    "read_document", "transcribe_audio", "read_channel",
+    "read_document", "transcribe_audio", "read_channel", "list_public_channels",
 })
 WRITE_OPERATIONS = frozenset({"send_message", "send_media"})
 SUPPORTED_OPERATIONS = READ_OPERATIONS | WRITE_OPERATIONS
@@ -124,6 +124,8 @@ class Service:
         self.lock = asyncio.Lock()
         self.snapshots = OrderedDict()
         self.cursors = OrderedDict()
+        self.public_channel_snapshots = OrderedDict()
+        self.public_channel_cursors = OrderedDict()
         self._send_attempted = False
 
     async def invoke(self, operation, *args, **kwargs):
@@ -132,7 +134,7 @@ class Service:
             return {"error": "unauthorized"}
         if operation not in SUPPORTED_OPERATIONS:
             return {"error": "unknown_tool"}
-        if operation == "read_channel" and not self.targeted_channel_reads_enabled:
+        if operation in {"read_channel", "list_public_channels"} and not self.targeted_channel_reads_enabled:
             return {"error": "channel_reads_disabled"}
         async with self.lock:
             self._send_attempted = False
@@ -786,6 +788,114 @@ class Service:
         payload["complete"] = not has_more
         if has_more and records:
             payload["next_before_id"] = records[-1]["message_id"]
+        return payload
+
+    async def list_public_channels(self, limit=20, cursor=None):
+        """List only subscribed public broadcast-channel metadata, without posts."""
+        if "telegram:read" not in SCOPES.get():
+            raise Denied("unauthorized")
+        if not self.targeted_channel_reads_enabled:
+            raise Denied("channel_reads_disabled")
+        integer(limit, 1, 50)
+        now = self.clock()
+        expired = {key for key, value in self.public_channel_snapshots.items()
+                   if value["expires"] <= now}
+        for key in expired:
+            del self.public_channel_snapshots[key]
+        for token, location in list(self.public_channel_cursors.items()):
+            if location[0] in expired:
+                del self.public_channel_cursors[token]
+
+        if cursor is not None:
+            if (not isinstance(cursor, str) or len(cursor) > 128 or
+                    cursor not in self.public_channel_cursors):
+                raise Denied("invalid_cursor")
+            snap, block_index, start = self.public_channel_cursors[cursor]
+            if snap not in self.public_channel_snapshots:
+                raise Denied("invalid_cursor")
+        else:
+            snap = next((key for key, value in reversed(self.public_channel_snapshots.items())
+                         if value["expires"] > now), None)
+            if snap is None:
+                start_listing = getattr(self.backend, "start_public_channel_listing", None)
+                if start_listing is None:
+                    raise Denied("channel_list_unavailable")
+                state = start_listing()
+                snap = secrets.token_urlsafe(24)
+                self.public_channel_snapshots[snap] = {
+                    "expires": now + 300, "state": state, "blocks": [], "seen_peer_ids": set()}
+                while len(self.public_channel_snapshots) > 4:
+                    removed, _ = self.public_channel_snapshots.popitem(last=False)
+                    for token, location in list(self.public_channel_cursors.items()):
+                        if location[0] == removed:
+                            del self.public_channel_cursors[token]
+            block_index, start = 0, 0
+
+        listing = self.public_channel_snapshots[snap]
+        self.public_channel_snapshots.move_to_end(snap)
+        if block_index == len(listing["blocks"]):
+            fetch = getattr(self.backend, "public_channel_page", None)
+            if fetch is None:
+                raise Denied("channel_list_unavailable")
+            result = await fetch(listing["state"], limit)
+            if (not isinstance(result, dict) or not isinstance(result.get("rows"), (list, tuple)) or
+                    type(result.get("done")) is not bool or type(result.get("truncated")) is not bool):
+                raise Denied("channel_list_unavailable")
+            channels = []
+            seen_peer_ids = set(listing["seen_peer_ids"])
+            for row in result["rows"]:
+                if not isinstance(row, dict) or row.get("type") != "broadcast_channel":
+                    continue
+                username = row.get("username")
+                if not isinstance(username, str) or not CHANNEL_USERNAME.fullmatch(username):
+                    continue
+                try:
+                    target = validate_peer_id(row.get("peer_id"))
+                except Denied:
+                    raise Denied("channel_list_unavailable") from None
+                if target > -1_000_000_000_000:
+                    raise Denied("channel_list_unavailable")
+                if target in seen_peer_ids:
+                    continue
+                seen_peer_ids.add(target)
+                raw_title = row.get("title")
+                raw_title = raw_title if isinstance(raw_title, str) else ""
+                safe_title = "".join(ch for ch in raw_title if ord(ch) >= 0x20 and ord(ch) != 0x7f)
+                title, title_truncated = clip(safe_title, 120)
+                channels.append({"peer_id": target, "username": username, "title": title,
+                                 "title_truncated": title_truncated,
+                                 "public_url": f"https://t.me/{username}"})
+            listing["seen_peer_ids"] = seen_peer_ids
+            listing["blocks"].append({"rows": channels, "done": result["done"],
+                                      "truncated": result["truncated"]})
+
+        block = listing["blocks"][block_index]
+        page = block["rows"][start:start + limit]
+        payload = {"channels": page, "next_cursor": None, "complete": False,
+                   "incomplete": True, "truncated": block["truncated"],
+                   "untrusted_content": True}
+        # Keep room for the random cursor in the bounded MCP response.
+        if start + len(page) < len(block["rows"]) or (not block["done"] and not block["truncated"]):
+            payload["next_cursor"] = "x" * 32
+        while wire_size(payload) > MAX_BYTES - 64 and page:
+            page.pop()
+        next_location = None
+        end = start + len(page)
+        if end < len(block["rows"]):
+            next_location = (snap, block_index, end)
+        elif not block["done"] and not block["truncated"]:
+            next_location = (snap, block_index + 1, 0)
+        if next_location is not None:
+            token = secrets.token_urlsafe(24)
+            self.public_channel_cursors[token] = next_location
+            while len(self.public_channel_cursors) > 256:
+                self.public_channel_cursors.popitem(last=False)
+            payload["next_cursor"] = token
+        else:
+            payload["next_cursor"] = None
+        complete = next_location is None and block["done"] and not block["truncated"]
+        payload["complete"] = complete
+        payload["incomplete"] = not complete
         return payload
 
     async def get_reply_context(self, peer_id, message_id, radius=3):

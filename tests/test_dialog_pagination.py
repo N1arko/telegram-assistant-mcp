@@ -343,6 +343,63 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
             client.disconnect.assert_awaited_once()
 
 
+class PublicChannelListingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.context = SCOPES.set(frozenset({'telegram:read'}))
+    def tearDown(self):
+        SCOPES.reset(self.context)
+
+    async def test_real_dialog_iterator_returns_public_identity_only(self):
+        page = response([2206439398], broadcast=True, username='niar42',
+                        terminal=True, count=1)
+        page.messages[0].message = 'must never be returned'
+        page.dialogs[0].unread_count = 88
+        page.dialogs[0].read_inbox_max_id = 77
+        class PeerCheckClient(OfflineClient):
+            async def __call__(self, request, *args, **kwargs):
+                if isinstance(request, functions.messages.GetPeerDialogsRequest):
+                    self.requests.append(copy.deepcopy(request))
+                    return SimpleNamespace(dialogs=[], users=[], chats=[])
+                return await super().__call__(request, *args, **kwargs)
+
+        client = PeerCheckClient([page])
+        client.get_messages = AsyncMock()
+        backend = TelethonBackend(client)
+        service = Service(backend, gate=RateGate(limit=1000),
+                          targeted_channel_reads_enabled=True)
+
+        result = await service.invoke('list_public_channels', limit=5)
+
+        self.assertEqual(result['channels'], [{
+            'peer_id': -1002206439398, 'username': 'niar42', 'title': 'channel',
+            'title_truncated': False, 'public_url': 'https://t.me/niar42',
+        }])
+        self.assertTrue(result['complete'])
+        self.assertFalse(result['incomplete'])
+        self.assertNotIn('must never be returned', repr(result))
+        self.assertNotIn('unread', repr(result))
+        self.assertEqual(backend.peers, {})
+        self.assertEqual(len(client.requests), 1)
+        self.assertIsInstance(client.requests[0], functions.messages.GetDialogsRequest)
+        self.assertEqual(client.requests[0].limit, 5)
+        private_route = await service.invoke('get_history', peer_id=-1002206439398, limit=1)
+        self.assertEqual(private_route, {'error': 'peer_not_in_dialogs'})
+        client.get_messages.assert_not_awaited()
+
+    async def test_private_or_non_broadcast_dialogs_are_not_listed(self):
+        for page in (response([2206439398], broadcast=True, username=None,
+                              terminal=True, count=1),
+                     response([42], terminal=True, count=1)):
+            with self.subTest(has_channel=bool(page.chats)):
+                client = OfflineClient([page])
+                service = Service(TelethonBackend(client), gate=RateGate(limit=1000),
+                                  targeted_channel_reads_enabled=True)
+                result = await service.invoke('list_public_channels', limit=5)
+                self.assertEqual(result['channels'], [])
+                self.assertTrue(result['complete'])
+                self.assertEqual(len(client.requests), 1)
+
+
 class PersistentRateTests(unittest.TestCase):
     def test_restart_preserves_local_rate_window_without_flood(self):
         with tempfile.TemporaryDirectory() as root:

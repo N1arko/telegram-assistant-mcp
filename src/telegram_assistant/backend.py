@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 import os
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from .security import Denied
 
 
@@ -54,6 +54,9 @@ class DialogListing:
     archived: bool | None
     exhausted: bool = False
     truncated: bool = False
+    # If a FloodWait lands after some raw dialog rows were consumed, preserve
+    # only public channel identity metadata so a retry doesn't skip them.
+    pending_public_rows: list = field(default_factory=list)
 
 
 class TelethonBackend:
@@ -119,6 +122,10 @@ class TelethonBackend:
         iterator = self.client.iter_dialogs(limit=None, archived=archived, **options).__aiter__()
         iterator.client = budget
         return DialogListing(iterator, budget, archived)
+
+    def start_public_channel_listing(self):
+        """Start a separate, bounded view of subscribed public broadcasts."""
+        return self.start_dialogs(archived=None)
 
     @staticmethod
     def dialog_checkpoint(state):
@@ -232,6 +239,66 @@ class TelethonBackend:
         if state.budget.scanned >= 5000 and not state.exhausted:
             state.truncated = True
         return {'rows': rows, 'done': state.exhausted or state.truncated, 'truncated': state.truncated}
+
+    async def public_channel_page(self, state, limit):
+        """Return only public broadcast identity metadata from one dialog RPC page.
+
+        Telethon's GetDialogs response also carries top-message fields. Scrub
+        message bodies immediately and never inspect or return unread counters,
+        last-message IDs/dates, or draft contents here.
+        """
+        from telethon.utils import get_peer_id
+
+        rows = []
+        pending = state.pending_public_rows
+        if pending:
+            rows = pending[:limit]
+            state.pending_public_rows = pending[limit:]
+            return {'rows': rows, 'done': state.exhausted and not state.pending_public_rows,
+                    'truncated': state.truncated}
+        state.budget.remaining = 1
+        state.budget.limit = min(limit, 5000 - state.budget.scanned)
+        if state.exhausted or state.budget.limit <= 0:
+            state.truncated |= not state.exhausted
+            return {'rows': rows, 'done': True, 'truncated': state.truncated}
+        try:
+            for _ in range(limit):
+                dialog = None
+                try:
+                    dialog = await state.iterator.__anext__()
+                except _PageBoundary:
+                    break
+                except StopAsyncIteration:
+                    state.exhausted = True
+                    state.truncated |= not state.budget.terminal
+                    break
+                finally:
+                    self._scrub(state.iterator)
+                try:
+                    entity = dialog.entity
+                    if (self.kind(entity) != 'broadcast_channel' or
+                            getattr(entity, 'left', False) is True):
+                        continue
+                    username = getattr(entity, 'username', None)
+                    if not isinstance(username, str) or not username:
+                        continue
+                    rows.append({'peer_id': get_peer_id(entity), 'type': 'broadcast_channel',
+                                 'username': username, 'title': getattr(entity, 'title', None) or ''})
+                finally:
+                    self._scrub_dialog(dialog)
+        except BaseException:
+            # The SDK iterator has advanced past rows already yielded. Keep
+            # those names in the in-memory listing state before propagating a
+            # FloodWait or cancellation; a retry drains them before another RPC.
+            state.pending_public_rows = rows
+            raise
+        if state.iterator.left <= 0:
+            state.exhausted = True
+        state.truncated |= state.budget.truncated
+        if state.budget.scanned >= 5000 and not state.exhausted:
+            state.truncated = True
+        return {'rows': rows, 'done': state.exhausted or state.truncated,
+                'truncated': state.truncated}
 
     async def resolve(self, target):
         from telethon import functions, types
