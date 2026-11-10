@@ -7,11 +7,13 @@ LABEL org.opencontainers.image.revision=${RELEASE_COMMIT}
 USER root
 WORKDIR /app
 COPY pyproject.toml requirements.lock README.md LICENSE NOTICE ./
-RUN rm -rf /app/src /app/build
+RUN rm -rf /app/src /app/build \
+    && python -c "import sysconfig,shutil; from pathlib import Path; root=Path(sysconfig.get_paths()['purelib']); [shutil.rmtree(p) for p in root.glob('telegram_assistant_mcp-*.dist-info')]; shutil.rmtree(root/'telegram_assistant', ignore_errors=True)"
 COPY src ./src
 COPY deploy/verify_locked_dependencies.py /tmp/verify_locked_dependencies.py
 RUN python /tmp/verify_locked_dependencies.py requirements.lock \
     && python -m pip install --no-index --no-deps --no-build-isolation . \
+    && rm -rf /app/src/telegram_assistant_mcp.egg-info \
     && python -m pip check \
     && rm /tmp/verify_locked_dependencies.py
 USER 10001:10001
