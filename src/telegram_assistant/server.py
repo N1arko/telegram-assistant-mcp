@@ -46,6 +46,7 @@ READ_ONLY_BROADCAST_CHANNEL = None
 
 from .auth import AuthConfig, JWKSVerifier, https_url
 from .auth_diagnostics import Auth401Diagnostics, Auth401Middleware
+from . import diagnostics as tg_diagnostics
 from .security import Denied, private_file
 from .service import MAX_BYTES
 from .media import (AudioResult, ImageResult, MAX_AUDIO_RESPONSE_BYTES, MAX_MEDIA_RESPONSE_BYTES,
@@ -547,13 +548,17 @@ async def serve(args):
                 if ready:
                     return
                 try:
+                    tg_diagnostics.stage("connect")
                     await asyncio.wait_for(client.connect(), 20)
+                    tg_diagnostics.stage("authorize")
                     if not await asyncio.wait_for(client.is_user_authorized(), 20):
                         raise Denied("session_not_authorized")
+                    tg_diagnostics.stage("get_me")
                     me = await asyncio.wait_for(client.get_me(), 20)
                     if me is None or me.bot:
                         raise Denied("user_session_required")
                     ready = True
+                    tg_diagnostics.stage("operation")
                 except BaseException:
                     await client.disconnect()
                     raise

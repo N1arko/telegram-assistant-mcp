@@ -5,6 +5,7 @@ import time
 import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from . import diagnostics
 from .security import Denied
 
 
@@ -311,6 +312,7 @@ class TelethonBackend:
         if entity is not None and self.kind(entity) not in {'user','group'} and not self._is_allowed_broadcast(target, entity):
             raise Denied('peer_not_in_dialogs')
         await self.activate()
+        diagnostics.stage("resolve_peer")
         if not fresh:
             # Targeted membership check. History/search never cause a hidden
             # complete catalogue scan, including for a peer from an older page.
@@ -504,6 +506,7 @@ class TelethonBackend:
 
     async def history(self, target, *, limit, before_id=None, query=None):
         await self.activate()
+        diagnostics.stage("history")
         kwargs = {"limit": limit, "offset_id": before_id or 0}
         if query is not None:
             kwargs["search"] = query

@@ -13,6 +13,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from . import diagnostics
 from .security import Denied, Policy, Quotas, RateGate, integer, peer_id as validate_peer_id
 from .media import (AudioResult, ImageResult, MAX_AUDIO_INPUT_BYTES, MAX_INLINE_AUDIO_BYTES,
                     MAX_AUDIO_RESPONSE_BYTES, MAX_IMAGE_PREVIEW_BYTES, MAX_IMAGE_INPUT_BYTES,
@@ -138,6 +139,7 @@ class Service:
         if operation in {"read_channel", "list_public_channels"} and not self.targeted_channel_reads_enabled:
             return {"error": "channel_reads_disabled"}
         async with self.lock:
+            diagnostics.state.set({"stage": "operation"})
             self._send_attempted = False
             try:
                 self.gate.check(count_local=operation not in READ_OPERATIONS)
@@ -157,17 +159,22 @@ class Service:
                             ((len(result.data) + 2) // 3) * 4 + 8192 > MAX_AUDIO_RESPONSE_BYTES):
                         raise Denied("audio_response_too_large")
                     return result
-                return bounded(result)
+                result = bounded(result)
+                diagnostics.record(operation, self.backend, "success")
+                return result
             except Denied as exc:
+                diagnostics.record(operation, self.backend, "denied", exc)
                 result = {"error": exc.code}
                 if exc.retry_after is not None:
                     result["retry_after_seconds"] = exc.retry_after
                 return result
-            except TimeoutError:
+            except TimeoutError as exc:
+                diagnostics.record(operation, self.backend, "timeout", exc)
                 return {"error": ("delivery_unknown" if self._send_attempted else "send_preflight_unavailable")
                         if operation in {"send_message", "send_media"} else
                         ("media_timeout" if operation in MEDIA_OPERATIONS else "telegram_timeout")}
             except Exception as exc:
+                diagnostics.record(operation, self.backend, "exception", exc)
                 # Inspect structured flood fields only; never return/log repr or args.
                 if type(exc).__name__ in {"FloodWaitError", "SlowModeWaitError", "FloodPremiumWaitError"}:
                     seconds = max(1, int(getattr(exc, "seconds", 60)))
