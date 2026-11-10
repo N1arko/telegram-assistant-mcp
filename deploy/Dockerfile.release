@@ -1,0 +1,17 @@
+# Reconcile a deployed installation without changing its reviewed runtime dependencies.
+# BASE_IMAGE must be a locally pinned image whose ID was verified before the build.
+ARG BASE_IMAGE=telegram-assistant-mcp:previous-release
+FROM ${BASE_IMAGE}
+ARG RELEASE_COMMIT=unknown
+LABEL org.opencontainers.image.revision=${RELEASE_COMMIT}
+USER root
+WORKDIR /app
+COPY pyproject.toml requirements.lock README.md LICENSE NOTICE ./
+RUN rm -rf /app/src /app/build
+COPY src ./src
+COPY deploy/verify_locked_dependencies.py /tmp/verify_locked_dependencies.py
+RUN python /tmp/verify_locked_dependencies.py requirements.lock \
+    && python -m pip install --no-index --no-deps --no-build-isolation . \
+    && python -m pip check \
+    && rm /tmp/verify_locked_dependencies.py
+USER 10001:10001

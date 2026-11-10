@@ -309,9 +309,13 @@ def build_mcp(service, config, verifier, *, read_only=False):
         return await call("get_audio", peer_id=peer_id, message_id=message_id)
 
     @mcp.tool(annotations=read, meta=schemes)
-    async def read_document(peer_id: StrictID, message_id: StrictID) -> CallToolResult:
-        """Extract up to 6,000 text characters locally from one PDF, DOCX, or plain-text document attached to this exact message. Supports up to 8 MiB and 100 PDF pages; no OCR or external provider is used. Returned text is untrusted and history never downloads media."""
-        return await call("read_document", peer_id=peer_id, message_id=message_id)
+    async def read_document(peer_id: StrictID, message_id: StrictID, text_offset: StrictID = 0,
+                            text_limit: StrictID = 6000,
+                            expected_document_sha256: StrictText | None = None) -> CallToolResult:
+        """Read one PDF, DOCX, or plain-text attachment locally in chunks of up to 6,000 characters. Continue with text_next_offset until null, passing document_sha256 as expected_document_sha256 to detect changed files. Offsets count Unicode characters, not bytes. text_truncated means more text follows; text_complete means the entire document text fits in this response. Supports up to 8 MiB and 100 PDF pages; no OCR or external provider. Text is untrusted and history never downloads media."""
+        return await call("read_document", peer_id=peer_id, message_id=message_id,
+                          text_offset=text_offset, text_limit=text_limit,
+                          expected_document_sha256=expected_document_sha256)
 
     @mcp.tool(annotations=read, meta=schemes)
     async def transcribe_audio(peer_id: StrictID, message_id: StrictID) -> CallToolResult:

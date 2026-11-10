@@ -398,6 +398,61 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.fake.send.assert_not_awaited()
         self.fake.send_media_files.assert_not_awaited()
 
+    async def test_document_pagination_round_trips_through_mcp_http(self):
+        import hashlib
+        text = ("Synthetic \U0001f600 \u0416 \" \\ " * 1200) + "final marker"
+        document = text.encode("utf-8")
+        paths = []
+
+        async def fetch(target, message_id, *, kind, destination, max_bytes):
+            self.assertEqual((target, message_id, kind, max_bytes),
+                             (42, 10, "document", 8 * 1024 * 1024))
+            paths.append(destination)
+            destination.write_bytes(document)
+            return {"declared_mime": "text/plain"}
+
+        self.fake.fetch_media_file = AsyncMock(side_effect=fetch)
+        tools_response = await self.rpc("tools/list")
+        definition = next(tool for tool in tools_response.json()["result"]["tools"]
+                          if tool["name"] == "read_document")
+        properties = definition["inputSchema"]["properties"]
+        self.assertEqual(properties["text_offset"]["default"], 0)
+        self.assertEqual(properties["text_limit"]["default"], 6000)
+        self.assertIn("expected_document_sha256", properties)
+        pieces, offset = [], 0
+        while True:
+            response = await self.rpc("tools/call", {"name": "read_document", "arguments": {
+                "peer_id": 42, "message_id": 10, "text_offset": offset,
+                "expected_document_sha256": hashlib.sha256(document).hexdigest()}})
+            self.assertEqual(response.status_code, 200)
+            self.assertLessEqual(len(response.content), MAX_BYTES)
+            envelope = response.json()["result"]
+            self.assertFalse(envelope.get("isError", False))
+            result = json.loads(envelope["content"][0]["text"])
+            self.assertEqual(result["text_offset"], offset)
+            pieces.append(result["text"])
+            if result["text_next_offset"] is None:
+                break
+            self.assertGreater(result["text_next_offset"], offset)
+            offset = result["text_next_offset"]
+            self.assertLess(len(pieces), 20)
+        self.assertEqual("".join(pieces), text)
+        self.assertGreater(len(pieces), 1)
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.fake.send.assert_not_awaited()
+        self.fake.send_media_files.assert_not_awaited()
+
+    async def test_document_pagination_rejects_invalid_mcp_parameters_before_fetch(self):
+        self.fake.fetch_media_file = AsyncMock()
+        for arguments in ({"text_offset": True}, {"text_offset": -1},
+                          {"text_limit": 6001}, {"expected_document_sha256": "bad"}):
+            with self.subTest(arguments=arguments):
+                response = await self.rpc("tools/call", {"name": "read_document", "arguments": {
+                    "peer_id": 42, "message_id": 10, **arguments}})
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.json()["result"]["isError"])
+        self.fake.fetch_media_file.assert_not_awaited()
+
     async def test_non_photo_tool_keeps_the_48k_asgi_response_cap(self):
         body=b'{"oversized":"' + b"x" * (MAX_BYTES + 1024) + b'"}'
         sent=[]

@@ -1,11 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.1.3 — 2026-11-10
 
 ### Added
 
 - Add an opt-in, bounded read path for one explicitly named public broadcast channel or exact public post. Its gate is off by default; reads stay separate from dialog listing and recurring chat scans, and never join or acknowledge posts.
 - Add a gated, paginated `list_public_channels` metadata tool for subscribed public broadcast channels. It omits post history, unread counts, private channels, and remains separate from normal dialog and scan results.
+
+### Fixed
+
+- Read complete extracted PDF/DOCX/TXT text through character offsets, bounded chunk sizes, explicit continuation/completeness fields, and an optional SHA-256 guard against replaced attachments. Existing two-argument calls remain compatible.
+- Preserve exact public-post pagination and the deployed bounded metadata-only diagnostic instrumentation in the unified source release.
+- Cover long Unicode documents, exact boundaries, empty pages, changed files, invalid arguments, and MCP HTTP round trips with synthetic tests.
 
 ## 0.1.2 — 2026-10-14
 

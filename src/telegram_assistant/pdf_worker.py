@@ -37,9 +37,11 @@ def main() -> int:
 
     try:
         from .media import extract_document_text
-        if len(sys.argv) != 2:
+        if len(sys.argv) not in {2, 4}:
             raise ValueError
-        result = extract_document_text(Path(sys.argv[1]))
+        options = ({"text_offset": int(sys.argv[2]), "max_chars": int(sys.argv[3])}
+                   if len(sys.argv) == 4 else {})
+        result = extract_document_text(Path(sys.argv[1]), **options)
         payload = {"text": result.text, "pages": result.pages,
                    "truncated": result.truncated}
     except Exception as exc:

@@ -22,7 +22,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .security import Denied
+from .security import Denied, integer
 
 MAX_IMAGE_INPUT_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_PIXELS = 12_000_000
@@ -91,12 +91,31 @@ class OutboundMediaFile:
     has_audio: bool = False
 
 
-def _bounded_text(parts, max_chars: int) -> tuple[str, bool]:
-    text = "".join(parts)
-    return text[:max_chars], len(text) > max_chars
+class _DocumentTextWindow:
+    """Skip a character offset and retain just one bounded chunk plus lookahead."""
+    def __init__(self, offset: int, limit: int):
+        self.skip = offset
+        self.limit = limit
+        self.parts = []
+        self.count = 0
+
+    def add(self, value: str) -> bool:
+        if self.skip:
+            skipped = min(self.skip, len(value))
+            self.skip -= skipped
+            value = value[skipped:]
+        remaining = self.limit + 1 - self.count
+        if value and remaining:
+            part = value[:remaining]
+            self.parts.append(part)
+            self.count += len(part)
+        return self.count > self.limit
+
+    def result(self) -> tuple[str, bool]:
+        return "".join(self.parts)[:self.limit], self.count > self.limit
 
 
-def _extract_pdf_text(path: Path, max_chars: int) -> DocumentText:
+def _extract_pdf_text(path: Path, max_chars: int, text_offset: int) -> DocumentText:
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -109,34 +128,22 @@ def _extract_pdf_text(path: Path, max_chars: int) -> DocumentText:
             page_count = len(reader.pages)
             if page_count > MAX_DOCUMENT_PAGES:
                 raise Denied("document_too_many_pages")
-            parts, count, truncated = [], 0, False
+            window = _DocumentTextWindow(text_offset, max_chars)
             for page in reader.pages:
                 value = page.extract_text() or ""
                 if not isinstance(value, str):
                     raise Denied("document_parse_failed")
-                remaining = max_chars - count
-                if len(value) > remaining:
-                    parts.append(value[:remaining])
-                    truncated = True
+                if window.add(value) or window.add("\n\n"):
                     break
-                parts.append(value)
-                count += len(value)
-                if count < max_chars:
-                    parts.append("\n\n")
-                    count += 2
-                else:
-                    truncated = True
-                    break
-            text, extra = _bounded_text(parts, max_chars)
-            return DocumentText(text, "pdf", pages=page_count,
-                                truncated=truncated or extra)
+            text, truncated = window.result()
+            return DocumentText(text, "pdf", pages=page_count, truncated=truncated)
     except Denied:
         raise
     except Exception:
         raise Denied("document_parse_failed") from None
 
 
-def _extract_docx_text(path: Path, max_chars: int) -> DocumentText:
+def _extract_docx_text(path: Path, max_chars: int, text_offset: int) -> DocumentText:
     try:
         with zipfile.ZipFile(path) as archive:
             entries = archive.infolist()
@@ -168,7 +175,7 @@ def _extract_docx_text(path: Path, max_chars: int) -> DocumentText:
             ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
             text_tag, paragraph_tag, tab_tag = ns + "t", ns + "p", ns + "tab"
             break_tags = {ns + "br", ns + "cr"}
-            parts, count, truncated = [], 0, False
+            window = _DocumentTextWindow(text_offset, max_chars)
             for _, element in ET.iterparse(BytesIO(xml), events=("end",)):
                 if element.tag == text_tag:
                     value = element.text or ""
@@ -178,18 +185,11 @@ def _extract_docx_text(path: Path, max_chars: int) -> DocumentText:
                     value = "\n"
                 else:
                     value = ""
-                if value:
-                    remaining = max_chars - count
-                    if len(value) > remaining:
-                        parts.append(value[:remaining])
-                        truncated = True
-                        break
-                    parts.append(value)
-                    count += len(value)
-                    if count >= max_chars:
-                        truncated = True
-                        break
-            return DocumentText("".join(parts), "docx", truncated=truncated)
+                if window.add(value):
+                    break
+                element.clear()
+            text, truncated = window.result()
+            return DocumentText(text, "docx", truncated=truncated)
     except Denied:
         raise
     except Exception:
@@ -222,8 +222,11 @@ def _decode_text_document(data: bytes, declared_mime: str | None) -> str:
 
 
 def extract_document_text(path: Path, *, declared_mime: str | None = None,
-                          max_chars: int = MAX_DOCUMENT_TEXT_CHARS) -> DocumentText:
-    """Extract bounded text locally from plain-text, DOCX, or text-based PDF files."""
+                          max_chars: int = MAX_DOCUMENT_TEXT_CHARS,
+                          text_offset: int = 0) -> DocumentText:
+    """Extract one character window locally without discarding the remaining text."""
+    integer(max_chars, 1, MAX_DOCUMENT_TEXT_CHARS)
+    integer(text_offset, 0, 2**31 - 1)
     try:
         size = path.stat().st_size
         if size <= 0:
@@ -233,14 +236,16 @@ def extract_document_text(path: Path, *, declared_mime: str | None = None,
         with path.open("rb") as source:
             header = source.read(1024)
         if b"%PDF-" in header:
-            return _extract_pdf_text(path, max_chars)
+            return _extract_pdf_text(path, max_chars, text_offset)
         if header.startswith(b"PK\x03\x04"):
-            return _extract_docx_text(path, max_chars)
+            return _extract_docx_text(path, max_chars, text_offset)
         if not isinstance(declared_mime, str) or len(declared_mime) > 96:
             declared_mime = None
         data = path.read_bytes()
         text = _decode_text_document(data, declared_mime)
-        clipped, truncated = _bounded_text([text], max_chars)
+        window = _DocumentTextWindow(text_offset, max_chars)
+        window.add(text)
+        clipped, truncated = window.result()
         return DocumentText(clipped, "text", truncated=truncated)
     except Denied:
         raise

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import math
 import re
@@ -232,8 +233,15 @@ class Service:
                          "wav": "audio/wav", "webm": "audio/webm"}[kind]
             return AudioResult(source.read_bytes(), mime_type)
 
-    async def read_document(self, peer_id, message_id):
+    async def read_document(self, peer_id, message_id, text_offset=0,
+                            text_limit=MAX_DOCUMENT_TEXT_CHARS, expected_document_sha256=None):
         integer(message_id, 1, 2**31 - 1)
+        integer(text_offset, 0, 2**31 - 1)
+        integer(text_limit, 1, MAX_DOCUMENT_TEXT_CHARS)
+        if expected_document_sha256 is not None and (
+                type(expected_document_sha256) is not str or len(expected_document_sha256) != 64 or
+                any(char not in "0123456789abcdef" for char in expected_document_sha256)):
+            raise Denied("invalid_argument")
         target = await self._resolve(peer_id, allow_broadcast=True)
         fetch = getattr(self.backend, "fetch_media_file", None)
         if fetch is None:
@@ -244,22 +252,47 @@ class Service:
                                   max_bytes=MAX_DOCUMENT_INPUT_BYTES)
             declared_mime = metadata.get("declared_mime") if isinstance(metadata, dict) else None
             with source.open("rb") as downloaded:
+                document_sha256 = hashlib.file_digest(downloaded, "sha256").hexdigest()
+                if expected_document_sha256 is not None and document_sha256 != expected_document_sha256:
+                    raise Denied("document_changed")
+                downloaded.seek(0)
                 is_pdf = b"%PDF-" in downloaded.read(1024)
             if is_pdf:
-                document = await self._extract_pdf_in_worker(source)
+                document = await self._extract_pdf_in_worker(
+                    source, text_offset=text_offset, text_limit=text_limit)
             else:
                 document = await asyncio.to_thread(
-                    extract_document_text, source, declared_mime=declared_mime)
-        return {"peer_id": target, "message_id": message_id,
-                "document_type": document.document_type, "pages": document.pages,
-                "text": document.text, "text_available": bool(document.text.strip()),
-                "text_truncated": document.truncated, "untrusted_content": True}
+                    extract_document_text, source, declared_mime=declared_mime,
+                    max_chars=text_limit, text_offset=text_offset)
+        def payload(length):
+            text = document.text[:length]
+            has_more = document.truncated or length < len(document.text)
+            return {"peer_id": target, "message_id": message_id,
+                    "document_type": document.document_type, "pages": document.pages,
+                    "text": text, "text_available": bool(text.strip()),
+                    "text_truncated": has_more, "text_offset": text_offset,
+                    "text_next_offset": text_offset + len(text) if has_more else None,
+                    "text_complete": text_offset == 0 and not has_more,
+                    "document_sha256": document_sha256, "untrusted_content": True}
+        # JSON escaping can consume more than the character limit suggests.
+        # Shorten this page only, preserving every remaining character for the next.
+        low, high = 0, len(document.text)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if wire_size(payload(middle)) <= MAX_BYTES:
+                low = middle
+            else:
+                high = middle - 1
+        return payload(low)
 
     @staticmethod
-    async def _extract_pdf_in_worker(path):
+    async def _extract_pdf_in_worker(path, *, text_offset=0, text_limit=MAX_DOCUMENT_TEXT_CHARS):
+        integer(text_offset, 0, 2**31 - 1)
+        integer(text_limit, 1, MAX_DOCUMENT_TEXT_CHARS)
         try:
             stdout = await _run_bounded(
-                [sys.executable, "-m", "telegram_assistant.pdf_worker", str(path)],
+                [sys.executable, "-m", "telegram_assistant.pdf_worker", str(path),
+                 str(text_offset), str(text_limit)],
                 timeout=PDF_WORKER_TIMEOUT_SECONDS, max_stdout=PDF_WORKER_OUTPUT_BYTES)
         except Denied as exc:
             code = {"media_processor_unavailable": "document_parser_unavailable",
@@ -278,7 +311,7 @@ class Service:
                 "document_parse_failed", "document_isolation_unavailable"}:
             raise Denied(error)
         text, pages, truncated = result.get("text"), result.get("pages"), result.get("truncated")
-        if (not isinstance(text, str) or len(text) > MAX_DOCUMENT_TEXT_CHARS or type(pages) is not int or
+        if (not isinstance(text, str) or len(text) > text_limit or (truncated and not text) or type(pages) is not int or
                 not 0 <= pages <= 100 or type(truncated) is not bool):
             raise Denied("document_parse_failed")
         return DocumentText(text, "pdf", pages=pages, truncated=truncated)
