@@ -686,6 +686,18 @@ class Service:
                   "reply_to": message.get("reply_to"),
                   "topic_id": message.get("topic_id"),
                   "reply_peer_id": message.get("reply_peer_id"), "out": bool(message.get("out", False))}
+        origin = message.get("forward_origin")
+        record["is_forwarded"] = bool(message.get("is_forwarded") or origin is not None)
+        record["forward_origin"] = None
+        if record["is_forwarded"] and isinstance(origin, dict):
+            name, name_truncated = clip(origin.get("name") or "", 200)
+            author, author_truncated = clip(origin.get("post_author") or "", 200)
+            record["forward_origin"] = {
+                "peer_id": origin.get("peer_id"), "name": name or None,
+                "name_truncated": name_truncated, "date": origin.get("date"),
+                "channel_post": origin.get("channel_post"),
+                "post_author": author or None, "post_author_truncated": author_truncated,
+            }
         if exact_text_offset is not None:
             record.update({"text_offset": exact_text_offset,
                            "text_complete": complete_text,

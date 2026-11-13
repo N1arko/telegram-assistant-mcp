@@ -38,3 +38,12 @@ Use Python 3.11 or newer. The test suite uses mocked Telegram clients, HTTP Mock
 ## Attribution
 
 This is an independent project, not the PyPI package named `telegram-mcp`. It is based in part on patterns from [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp); see [NOTICE](NOTICE) and [LICENSE](LICENSE). The upstream snapshot and its scripts are not part of this repository.
+
+### Forwarded message metadata
+
+Read message records expose `is_forwarded` and nullable `forward_origin` (available
+`peer_id`, hidden-source `name`, original `date`, `channel_post`, `post_author`).
+`sender_id` remains the sender in the current chat, not the original author. Names
+and signatures are untrusted, capped at 200 characters with truncation flags. No
+source peer is resolved or read automatically. Telegram may hide the author or
+remove attribution entirely; `is_forwarded=false` is not proof of authorship.

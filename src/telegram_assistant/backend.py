@@ -396,6 +396,21 @@ class TelethonBackend:
         return "other" if getattr(message, "media", None) is not None else None
 
     @staticmethod
+    def forward_origin(message):
+        """Only metadata already supplied by Telegram; never resolve the origin."""
+        from telethon.utils import get_peer_id
+        header = getattr(message, "fwd_from", None)
+        if header is None:
+            return None
+        source = getattr(header, "from_id", None)
+        date = getattr(header, "date", None)
+        return {"peer_id": get_peer_id(source) if source is not None else None,
+                "name": getattr(header, "from_name", None),
+                "date": date.isoformat() if date else None,
+                "channel_post": getattr(header, "channel_post", None),
+                "post_author": getattr(header, "post_author", None)}
+
+    @staticmethod
     def record(message):
         from telethon.utils import get_peer_id
         reply = getattr(message, "reply_to", None)
@@ -405,6 +420,8 @@ class TelethonBackend:
                 "sender_id": message.sender_id, "has_media": message.media is not None,
                 "media_type": TelethonBackend.media_type(message),
                 "out": bool(getattr(message, "out", False)),
+                "is_forwarded": getattr(message, "fwd_from", None) is not None,
+                "forward_origin": TelethonBackend.forward_origin(message),
                 "reply_to": getattr(reply, "reply_to_msg_id", None),
                 "topic_id": getattr(reply, "reply_to_top_id", None),
                 "reply_peer_id": get_peer_id(reply_peer) if reply_peer else None}
