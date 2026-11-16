@@ -14,3 +14,13 @@ private/
 *.session
 *.session-*
 quotas.sqlite*
+
+# WhatsApp generated binaries and private state
+work/
+whatsapp-private/
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+whatsapp/bridge/wa-bridge
+whatsapp/bridge/personal-whatsapp-bridge

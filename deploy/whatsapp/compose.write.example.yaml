@@ -1,0 +1,5 @@
+# Optional overlay, enabled only for an explicitly authorized account/profile.
+# Account chat policy and the OAuth send scope remain separate required barriers.
+services:
+  assistant:
+    command: ["--container-network", "--auth-config", "/run/wa/auth.json", "--bridge-token-file", "/run/wa/bridge.token", "--account-id", "${WHATSAPP_ACCOUNT_ID:-default}", "--port", "${WHATSAPP_MCP_PORT:-8877}", "--bridge-port", "${WHATSAPP_BRIDGE_PORT:-8878}", "--enable-write"]

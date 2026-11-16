@@ -1,0 +1,9 @@
+**
+!whatsapp/
+!whatsapp/requirements.lock
+!src/
+!src/whatsapp_assistant/
+!src/whatsapp_assistant/*.py
+!deploy/
+!deploy/whatsapp/
+!deploy/whatsapp/Dockerfile.mcp

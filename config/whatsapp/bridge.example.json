@@ -1,0 +1,16 @@
+{
+  "account_id": "default",
+  "listen_port": 8878,
+  "expected_account_jid": "",
+  "state_dir": "/state",
+  "token_file": "/state/bridge.token",
+  "key_file": "/state/history.key",
+  "read_chats": [],
+  "write_chats": [],
+  "write_enabled": false,
+  "read_access": "allowlist",
+  "write_access": "allowlist",
+  "per_minute": 1,
+  "per_day": 20,
+  "encrypted_volume_confirmed": false
+}

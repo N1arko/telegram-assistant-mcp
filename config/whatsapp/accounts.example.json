@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "accounts": [
+    {
+      "account_id": "personal",
+      "private_dir": "/ABSOLUTE/ENCRYPTED/PATH/whatsapp/personal",
+      "resource": "https://wa-personal.niar42.com/mcp",
+      "mcp_port": 8877,
+      "bridge_port": 8878,
+      "enable_write": false
+    },
+    {
+      "account_id": "work",
+      "private_dir": "/ABSOLUTE/ENCRYPTED/PATH/whatsapp/work",
+      "resource": "https://wa-work.niar42.com/mcp",
+      "mcp_port": 8887,
+      "bridge_port": 8888,
+      "enable_write": false
+    }
+  ]
+}

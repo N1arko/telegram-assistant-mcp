@@ -1,0 +1,69 @@
+# Separate Compose project. No host ports. Bridge and MCP share a network namespace
+# so the bridge listener remains on 127.0.0.1; Caddy sees only MCP port 8877.
+name: personal-whatsapp-${WHATSAPP_ACCOUNT_ID:-default}
+services:
+  assistant:
+    build:
+      context: ../..
+      dockerfile: deploy/whatsapp/Dockerfile.mcp
+    image: personal-whatsapp-mcp:local
+    command: ["--container-network", "--auth-config", "/run/wa/auth.json", "--bridge-token-file", "/run/wa/bridge.token", "--account-id", "${WHATSAPP_ACCOUNT_ID:-default}", "--port", "${WHATSAPP_MCP_PORT:-8877}", "--bridge-port", "${WHATSAPP_BRIDGE_PORT:-8878}"]
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    init: true
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 384m
+    cpus: 0.5
+    networks:
+      edge:
+        aliases: ["personal-whatsapp-${WHATSAPP_ACCOUNT_ID:-default}-assistant"]
+    volumes:
+      - type: bind
+        source: ${WHATSAPP_PRIVATE_DIR:?Set an absolute encrypted private directory}/auth.json
+        target: /run/wa/auth.json
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${WHATSAPP_PRIVATE_DIR}/state/bridge.token
+        target: /run/wa/bridge.token
+        read_only: true
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
+    logging: {driver: none}
+
+  bridge:
+    build:
+      context: ../..
+      dockerfile: deploy/whatsapp/Dockerfile.bridge
+    image: personal-whatsapp-bridge:local
+    user: "10001:10001"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    init: true
+    restart: unless-stopped
+    pids_limit: 64
+    mem_limit: 512m
+    cpus: 0.5
+    network_mode: service:assistant
+    depends_on: [assistant]
+    volumes:
+      - type: bind
+        source: ${WHATSAPP_PRIVATE_DIR}/bridge.json
+        target: /run/wa/bridge.json
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${WHATSAPP_PRIVATE_DIR}/state
+        target: /state
+        bind: {create_host_path: false}
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=16m,mode=1777"]
+    logging: {driver: none}
+
+networks:
+  edge:
+    name: niar42-wa-${WHATSAPP_ACCOUNT_ID:-default}-edge
+    driver: bridge

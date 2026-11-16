@@ -1,0 +1,18 @@
+FROM golang:1.27.3-alpine3.24 AS build
+RUN apk add --no-cache python3 gcc musl-dev
+WORKDIR /app
+COPY whatsapp/bridge/go.mod whatsapp/bridge/go.sum /app/whatsapp/bridge/
+RUN cd whatsapp/bridge && go mod download
+COPY whatsapp/bridge /app/whatsapp/bridge
+COPY whatsapp/sdk /app/whatsapp/sdk
+COPY whatsapp/build.py /app/whatsapp/build.py
+RUN GOMAXPROCS=2 python3 whatsapp/build.py
+
+FROM alpine:3.24
+RUN apk add --no-cache ca-certificates
+COPY --from=build /app/whatsapp/bridge/wa-bridge /usr/local/bin/wa-bridge
+COPY whatsapp/licenses /usr/share/licenses/personal-whatsapp-bridge
+COPY whatsapp/THIRD-PARTY-NOTICES.md whatsapp/bridge/LICENSE /usr/share/licenses/personal-whatsapp-bridge/
+USER 10001:10001
+ENTRYPOINT ["wa-bridge"]
+CMD ["run", "--config", "/run/wa/bridge.json"]
