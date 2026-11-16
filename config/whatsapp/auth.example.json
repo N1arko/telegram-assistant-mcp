@@ -1,0 +1,7 @@
+{
+  "issuer": "https://YOUR-TENANT.auth0.com/",
+  "resource": "https://wa-mcp.niar42.com/mcp",
+  "jwks_url": "https://YOUR-TENANT.auth0.com/.well-known/jwks.json",
+  "allowed_subjects": ["REPLACE_WITH_EXACT_OWNER_SUBJECT"],
+  "algorithms": ["RS256"]
+}

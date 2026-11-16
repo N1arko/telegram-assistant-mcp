@@ -1,0 +1,14 @@
+**
+!whatsapp/
+!whatsapp/build.py
+!whatsapp/THIRD-PARTY-NOTICES.md
+!whatsapp/licenses/
+!whatsapp/licenses/*.txt
+!whatsapp/bridge/
+!whatsapp/bridge/*.go
+!whatsapp/bridge/go.mod
+!whatsapp/bridge/go.sum
+!whatsapp/bridge/LICENSE
+!deploy/
+!deploy/whatsapp/
+!deploy/whatsapp/Dockerfile.bridge

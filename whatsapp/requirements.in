@@ -1,0 +1,7 @@
+# Separate WhatsApp runtime. Keep the Telegram root lock unchanged.
+mcp==1.30.0
+httpx==0.28.1
+PyJWT[crypto]==2.15.1
+uvicorn==0.54.0
+pydantic==2.14.2
+certifi==2026.10.23
