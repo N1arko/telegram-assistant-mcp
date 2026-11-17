@@ -587,7 +587,7 @@ class TelethonBackend:
 
         declared_mime = None
         declared_duration = None
-        if kind == "photo" and self.media_type(message) == "photo":
+        if kind in {"photo", "original"} and self.media_type(message) == "photo":
             photo = message.photo
             candidates = []
             for size in getattr(photo, "sizes", ()) or ():
@@ -600,6 +600,9 @@ class TelethonBackend:
                     candidates.append((width * height, size, file_size))
             if not candidates:
                 raise Denied("unsupported_image_format")
+            if kind == "original":
+                # Never silently substitute a smaller preview for an original request.
+                candidates = [max(candidates, key=lambda row: row[0])]
             eligible = [row for row in candidates
                         if row[0] <= MAX_IMAGE_PIXELS and row[2] <= max_bytes]
             if not eligible:
@@ -629,7 +632,8 @@ class TelethonBackend:
             metadata = {"kind": "audio", "size": declared_size,
                         "declared_mime": declared_mime, "declared_duration": declared_duration,
                         "voice": bool(getattr(audio_attribute, "voice", False))}
-        elif kind == "document" and self.media_type(message) == "document":
+        elif ((kind == "document" and self.media_type(message) == "document") or
+              (kind == "original" and getattr(message, "document", None) is not None)):
             document = message.document
             declared_size = getattr(document, "size", None)
             if type(declared_size) is not int or declared_size <= 0:

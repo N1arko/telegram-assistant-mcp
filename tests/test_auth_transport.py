@@ -318,7 +318,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         names={t["name"] for t in response.json()["result"]["tools"]}
         self.assertEqual(names,{"list_dialogs","get_history","search_messages","get_reply_context",
                            "list_forum_topics","get_forum_topic",
-                               "scan_updates","view_photo","get_audio","read_document",
+                               "scan_updates","view_photo","get_audio","read_document","download_attachment",
                                "transcribe_audio","send_message","send_media"})
         for name in ["set_policy","edit_message","delete_message","mark_as_read","download_media","transcribe_voice"]:
             result=await self.rpc("tools/call",{"name":name,"arguments":{}})

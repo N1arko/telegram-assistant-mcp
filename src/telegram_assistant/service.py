@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import math
@@ -32,11 +33,11 @@ MEDIA_SEND_TIMEOUT_SECONDS = 120
 READ_OPERATIONS = frozenset({
     "list_dialogs", "get_history", "search_messages", "get_reply_context",
     "list_forum_topics", "get_forum_topic", "scan_updates", "view_photo", "get_audio",
-    "read_document", "transcribe_audio", "read_channel", "list_public_channels",
+    "download_attachment", "read_document", "transcribe_audio", "read_channel", "list_public_channels",
 })
 WRITE_OPERATIONS = frozenset({"send_message", "send_media"})
 SUPPORTED_OPERATIONS = READ_OPERATIONS | WRITE_OPERATIONS
-MEDIA_OPERATIONS = frozenset({"view_photo", "get_audio", "read_document", "transcribe_audio"})
+MEDIA_OPERATIONS = frozenset({"download_attachment", "view_photo", "get_audio", "read_document", "transcribe_audio"})
 CHANNEL_USERNAME = re.compile(r"^[A-Za-z0-9_]{5,32}$", re.ASCII)
 
 
@@ -197,6 +198,45 @@ class Service:
                 return {"error": ("delivery_unknown" if self._send_attempted else "send_preflight_unavailable")
                         if operation in {"send_message", "send_media"} else
                         ("media_unavailable" if operation in MEDIA_OPERATIONS else "telegram_unavailable")}
+
+    async def download_attachment(self, peer_id, message_id, offset=0, expected_sha256=None):
+        """Return bounded original bytes only through the authenticated MCP response."""
+        integer(message_id, 1, 2**31 - 1)
+        integer(offset, 0, 8 * 1024 * 1024)
+        if expected_sha256 is not None and (
+                type(expected_sha256) is not str or
+                re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None):
+            raise Denied("invalid_argument")
+        if offset and expected_sha256 is None:
+            raise Denied("attachment_hash_required")
+        target = await self._resolve(peer_id, allow_broadcast=True)
+        with temporary_media_dir() as directory:
+            source = Path(directory) / "attachment"
+            metadata = await self.backend.fetch_media_file(
+                target, message_id, kind="original", destination=source,
+                max_bytes=8 * 1024 * 1024)
+            size = source.stat().st_size
+            if not 0 < size <= 8 * 1024 * 1024:
+                raise Denied("attachment_too_large")
+            with source.open("rb") as file:
+                digest = hashlib.file_digest(file, "sha256").hexdigest()
+                if expected_sha256 is not None and digest != expected_sha256:
+                    raise Denied("attachment_changed")
+                if offset >= size:
+                    raise Denied("invalid_attachment_offset")
+                file.seek(offset)
+                data = file.read(24 * 1024)
+            end = offset + len(data)
+            # Never use a Telegram-provided filename as a path or trust its MIME.
+            return {"peer_id": target, "message_id": message_id,
+                    "filename": f"attachment-{message_id}.bin",
+                    "mime_type": "application/octet-stream",
+                    "kind": metadata.get("kind"), "size_bytes": size,
+                    "sha256": digest, "offset": offset, "chunk_bytes": len(data),
+                    "data_base64": base64.b64encode(data).decode("ascii"),
+                    "next_offset": end if end < size else None,
+                    "complete": end == size,
+                    "untrusted_content": True}
 
     async def view_photo(self, peer_id, message_id):
         integer(message_id, 1, 2**31 - 1)

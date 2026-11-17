@@ -19,7 +19,7 @@ class ReadOnlyTransportTests(unittest.IsolatedAsyncioTestCase):
         tools = response.json()['result']['tools']
         self.assertEqual({t['name'] for t in tools},
         {'list_dialogs','scan_updates','get_history','search_messages','get_reply_context',
-         'list_forum_topics','get_forum_topic','view_photo','get_audio','read_document',
+         'list_forum_topics','get_forum_topic','view_photo','get_audio','read_document','download_attachment',
          'transcribe_audio'})
         self.assertNotIn('read_channel', {t['name'] for t in tools})
         self.assertNotIn('list_public_channels', {t['name'] for t in tools})
@@ -85,7 +85,7 @@ class OptInTargetedChannelWriteTransportTests(unittest.IsolatedAsyncioTestCase):
         names = {tool['name'] for tool in tools}
         self.assertEqual(names, {
             'list_dialogs', 'get_history', 'search_messages', 'get_reply_context',
-            'list_forum_topics', 'get_forum_topic', 'scan_updates', 'view_photo',
+            'list_forum_topics', 'get_forum_topic', 'scan_updates', 'view_photo', 'download_attachment',
             'get_audio', 'read_document', 'transcribe_audio', 'send_message', 'send_media',
             'read_channel', 'list_public_channels',
         })

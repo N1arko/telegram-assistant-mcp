@@ -38,3 +38,7 @@
 ## Атрибуция
 
 Это независимый проект, не пакет PyPI с названием `telegram-mcp`. При разработке использованы некоторые решения из [chigwell/telegram-mcp](https://github.com/chigwell/telegram-mcp); подробности — в [NOTICE](NOTICE) и [LICENSE](LICENSE). Код и скрипты upstream-проекта в этот репозиторий не входят.
+
+## Original attachments / Оригиналы вложений
+
+`download_attachment(peer_id, message_id)` returns original bytes privately through the existing OAuth-authenticated MCP connection. No public URLs, additional scopes, or external storage. Maximum file: 8 MiB; each response carries up to 24 KiB as base64. Decode chunks in order, use `next_offset` and `expected_sha256` for continuation, and verify complete size and SHA-256 before opening. Each call fetches and validates the exact Telegram attachment afresh; no persistent media cache. Files and their content are untrusted. Keep client-side copies private and delete when no longer needed. A photo sent as a document is byte-exact. An ordinary photo is the largest Telegram-hosted rendition, not the camera original; oversized largest photos are rejected rather than silently downscaled. Existing chat/channel restrictions apply.
